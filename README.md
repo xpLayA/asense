@@ -300,6 +300,9 @@ The separate installer rebuilds and activates the optional kernel driver.
 
 ## Automatic fan curves
 
+See the [PHN16S-71 troubleshooting and session record](docs/PHN16S-71_FAN_CONTROL.md)
+for the reported problems, implemented fixes, validation, and remaining live checks.
+
 Select **Auto Curve** to edit separate CPU and GPU temperature/speed points,
 then choose **Apply and enable**. The daemon follows the curves once per second,
 continues after the window closes, and restores enabled curves after reboot.
