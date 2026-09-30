@@ -163,6 +163,9 @@ struct asense_rgb {
 	bool zone_preamble;
 	bool fan_behavior_available;
 	bool fan_speed_available;
+	/* Last confirmed CPU/GPU speed; saves one ~15 ms firmware call per store. */
+	u8 fan_speed_cache[2];
+	bool fan_speed_cache_valid[2];
 	bool profile_available;
 	bool battery_limit_available;
 	bool battery_calibration_available;
@@ -519,7 +522,15 @@ static int asense_read_fan_speed(struct asense_rgb *rgb, u8 fan, u8 *speed)
 	if (value > 100)
 		return -EPROTO;
 	*speed = value;
+	rgb->fan_speed_cache[fan == ASENSE_GPU_FAN_ID] = value;
+	rgb->fan_speed_cache_valid[fan == ASENSE_GPU_FAN_ID] = true;
 	return 0;
+}
+
+static void asense_invalidate_fan_speed_cache(struct asense_rgb *rgb)
+{
+	rgb->fan_speed_cache_valid[0] = false;
+	rgb->fan_speed_cache_valid[1] = false;
 }
 
 static int asense_write_fan_speed(struct asense_rgb *rgb, u8 fan, u8 speed)
@@ -1735,6 +1746,7 @@ static ssize_t asense_fan_mode_store(struct device *dev, u16 fan_bitmap,
 	 */
 	if (!error && previous == mode && mode != ASENSE_FAN_MODE_AUTO)
 		goto out;
+	asense_invalidate_fan_speed_cache(rgb);
 	if (!error)
 		error = asense_write_fan_mode(rgb, fan_bitmap, mode);
 	if (!error)
@@ -1782,7 +1794,15 @@ static ssize_t asense_fan_speed_store(struct device *dev, u8 fan,
 	if (requested > 100)
 		return -ERANGE;
 	mutex_lock(&rgb->lock);
-	error = asense_read_fan_speed(rgb, fan, &previous);
+	/* Firmware may only change the speed through a mode transition or
+	 * resume, both of which invalidate this cache.
+	 */
+	if (rgb->fan_speed_cache_valid[fan == ASENSE_GPU_FAN_ID]) {
+		previous = rgb->fan_speed_cache[fan == ASENSE_GPU_FAN_ID];
+		error = 0;
+	} else {
+		error = asense_read_fan_speed(rgb, fan, &previous);
+	}
 	previous_valid = !error;
 	if (!error && previous == requested)
 		goto out;
@@ -1803,6 +1823,8 @@ static ssize_t asense_fan_speed_store(struct device *dev, u8 fan,
 			dev_err(dev, "fan speed rollback failed\n");
 	}
 out:
+	if (error)
+		asense_invalidate_fan_speed_cache(rgb);
 	mutex_unlock(&rgb->lock);
 	return error ? error : count;
 }
@@ -2008,6 +2030,7 @@ static int asense_rgb_resume(struct device *dev)
 	int error = 0;
 
 	mutex_lock(&rgb->lock);
+	asense_invalidate_fan_speed_cache(rgb);
 	if (!rgb->rgb_cache_valid)
 		goto out;
 

@@ -710,3 +710,121 @@ int main(void) {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn fan_speed_store_uses_cached_previous_value_and_two_firmware_calls() {
+    // Run the driver's actual speed helpers and store with a counting transport.
+    let helpers = function_between(
+        "static int asense_read_fan_speed",
+        "static int asense_read_profile",
+    );
+    let store = function_between(
+        "static ssize_t asense_fan_speed_store",
+        "#define ASENSE_FAN_ATTRIBUTE",
+    );
+    let prelude = r#"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <assert.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <sys/types.h>
+typedef uint64_t u64;
+typedef uint8_t u8;
+#define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
+#define FIELD_GET(mask,value) (((value) & (mask)) >> __builtin_ctzll(mask))
+#define FIELD_PREP(mask,value) (((u64)(value) << __builtin_ctzll(mask)) & (mask))
+#define ASENSE_FAN_SPEED_SET 0x10
+#define ASENSE_FAN_SPEED_GET 0x11
+#define ASENSE_FAN_SPEED_STATUS_MASK GENMASK_ULL(7, 0)
+#define ASENSE_FAN_SPEED_ID_MASK GENMASK_ULL(7, 0)
+#define ASENSE_FAN_SPEED_VALUE_MASK GENMASK_ULL(15, 8)
+#define ASENSE_CPU_FAN_ID 0x01
+#define ASENSE_GPU_FAN_ID 0x04
+#define dev_err(...) ((void)0)
+struct asense_rgb { int lock; u8 fan_speed_cache[2]; bool fan_speed_cache_valid[2]; };
+struct device { struct asense_rgb *data; };
+static u8 firmware[5];
+static int gets, sets, fail_set;
+static void *dev_get_drvdata(struct device *dev) { return dev->data; }
+static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
+static void mutex_unlock(int *lock) { assert(*lock); *lock=0; }
+static int kstrtou8(const char *s, unsigned base, u8 *out) { *out=(u8)strtoul(s,0,base); return 0; }
+static int asense_gaming_get(struct asense_rgb *rgb, unsigned method, unsigned payload, u64 *out) {
+    assert(rgb->lock && method == ASENSE_FAN_SPEED_GET); gets++;
+    *out = (u64)firmware[payload & 0xff] << 8; return 0;
+}
+static int asense_gaming_set(struct asense_rgb *rgb, unsigned method, u64 payload) {
+    assert(rgb->lock && method == ASENSE_FAN_SPEED_SET); sets++;
+    if (fail_set) { fail_set--; return -EREMOTEIO; }
+    firmware[payload & 0xff] = (u8)(payload >> 8); return 0;
+}
+"#;
+    let cases = r#"
+int main(void) {
+    struct asense_rgb rgb={0}; struct device dev={&rgb};
+    firmware[ASENSE_CPU_FAN_ID]=40;
+    /* Cold cache: read previous, write, read back. */
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"50",2)==2);
+    assert(gets==2 && sets==1 && firmware[ASENSE_CPU_FAN_ID]==50);
+    /* Warm cache: write and read back only. */
+    gets=sets=0;
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"60",2)==2);
+    assert(gets==1 && sets==1 && firmware[ASENSE_CPU_FAN_ID]==60);
+    /* Idempotent store needs no firmware call. */
+    gets=sets=0;
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"60",2)==2);
+    assert(gets==0 && sets==0);
+    /* The GPU channel has its own cache entry. */
+    firmware[ASENSE_GPU_FAN_ID]=60;
+    assert(asense_fan_speed_store(&dev,ASENSE_GPU_FAN_ID,"60",2)==2);
+    assert(gets==1 && sets==0);
+    /* A failed write rolls back to the cached value and drops the cache. */
+    gets=sets=0; fail_set=1;
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"70",2)==-EREMOTEIO);
+    assert(sets==2 && firmware[ASENSE_CPU_FAN_ID]==60);
+    assert(!rgb.fan_speed_cache_valid[0] && !rgb.fan_speed_cache_valid[1]);
+    /* After invalidation, the next store rereads firmware. */
+    gets=sets=0; firmware[ASENSE_CPU_FAN_ID]=35;
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"35",2)==2);
+    assert(gets==1 && sets==0);
+    assert(asense_fan_speed_store(&dev,ASENSE_CPU_FAN_ID,"101",3)==-ERANGE);
+    return 0;
+}
+"#;
+    let directory =
+        std::env::temp_dir().join(format!("asense-fan-speed-c-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("fan_speed.c");
+    let binary = directory.join("fan-speed-test");
+    std::fs::write(&source, format!("{prelude}\n{helpers}\n{store}\n{cases}")).unwrap();
+    let build = std::process::Command::new("cc")
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-parameter",
+            "-Wno-unused-function",
+            // Kernel sysfs stores use the `error ? error : count` idiom.
+            "-Wno-sign-compare",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let result = std::process::Command::new(&binary).output().unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

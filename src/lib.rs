@@ -18,3 +18,5 @@ pub mod platform;
 pub mod probe;
 pub mod telemetry;
 pub mod tuning;
+
+pub(crate) mod timing;

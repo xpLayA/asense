@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::platform::find_wmi_group;
@@ -346,6 +347,7 @@ impl AcerHardware {
     /// Discover against an alternate filesystem root.  This is intended for
     /// tests and must never be wired to a user-controlled privileged CLI flag.
     pub fn discover_at(root: impl AsRef<Path>) -> Result<Self, HardwareError> {
+        let _timing = crate::timing::scope("discovery");
         let root = root.as_ref().to_path_buf();
         let platform = VerifiedPlatform::discover_at(&root)?;
 
@@ -484,6 +486,7 @@ impl AcerHardware {
     }
 
     pub fn apply_fan_setting(&self, setting: FanSetting) -> Result<FanState, HardwareError> {
+        let _timing = crate::timing::scope("fan_transition");
         self.require_acer()?;
         if self.fan_backend.is_none() {
             return Err(HardwareError::MissingInterface(rooted(
@@ -533,25 +536,83 @@ impl AcerHardware {
     }
 
     pub fn read_fan_state(&self) -> Result<FanState, HardwareError> {
+        self.read_fan_state_inner(true)
+    }
+
+    /// Controller readback excludes optional RPM firmware calls.
+    pub(crate) fn read_fan_control_state(&self) -> Result<FanState, HardwareError> {
+        self.read_fan_state_inner(false)
+    }
+
+    fn read_fan_state_inner(&self, include_rpm: bool) -> Result<FanState, HardwareError> {
+        let _timing = crate::timing::scope("fan_readback");
         Ok(FanState {
-            cpu: self.read_fan_channel(1)?,
-            gpu: self.read_fan_channel(2)?,
+            cpu: self.read_fan_channel(1, include_rpm)?,
+            gpu: self.read_fan_channel(2, include_rpm)?,
         })
     }
 
     /// Update an existing Manual session without cycling through Maximum.
     pub(crate) fn update_manual_fan_speeds(&self, cpu: u8, gpu: u8) -> Result<(), HardwareError> {
+        self.update_manual_fan_channels(Some(cpu), Some(gpu))
+    }
+
+    /// Mutate only changed channels of an already verified Manual session.
+    ///
+    /// Every Gaming-WMI fan call costs ~15 ms of firmware time that can stall
+    /// all CPUs, so that path performs no userspace reads: the ASense kernel
+    /// store already reads back each speed and fails with EIO on mismatch, and
+    /// the controller audits mode ownership separately. Upstream acer-wmi PWM
+    /// keeps pair-wide Manual verification.
+    pub(crate) fn update_manual_fan_channels(
+        &self,
+        cpu: Option<u8>,
+        gpu: Option<u8>,
+    ) -> Result<(), HardwareError> {
+        let _timing = crate::timing::scope("fan_update");
         self.require_acer()?;
-        validate_percent("CPU fan percent", cpu)?;
-        validate_percent("GPU fan percent", gpu)?;
-        self.verify_mode(1, FanMode::Manual)?;
-        self.verify_mode(2, FanMode::Manual)?;
-        self.write_speed_percent(1, cpu)?;
-        self.write_speed_percent(2, gpu)?;
-        self.verify_pwm_percent(1, cpu)?;
-        self.verify_pwm_percent(2, gpu)?;
-        self.verify_mode(1, FanMode::Manual)?;
-        self.verify_mode(2, FanMode::Manual)
+        for (channel, percent) in [(1, cpu), (2, gpu)] {
+            if let Some(percent) = percent {
+                validate_percent(
+                    if channel == 1 {
+                        "CPU fan percent"
+                    } else {
+                        "GPU fan percent"
+                    },
+                    percent,
+                )?;
+            }
+        }
+        if cpu.is_none() && gpu.is_none() {
+            return Ok(());
+        }
+        let kernel_verified = matches!(self.fan_backend, Some(FanInterface::AcerGamingWmi { .. }));
+        if !kernel_verified {
+            self.verify_mode(1, FanMode::Manual)?;
+            self.verify_mode(2, FanMode::Manual)?;
+        }
+        for (channel, percent) in [(1, cpu), (2, gpu)] {
+            if let Some(percent) = percent {
+                self.write_speed_percent(channel, percent)?;
+                if !kernel_verified {
+                    self.verify_pwm_percent(channel, percent)?;
+                }
+            }
+        }
+        if !kernel_verified {
+            self.verify_mode(1, FanMode::Manual)?;
+            self.verify_mode(2, FanMode::Manual)?;
+        }
+        Ok(())
+    }
+
+    /// Maximum ownership auditing must not depend on optional RPM or PWM.
+    pub(crate) fn read_fan_modes(&self) -> Result<[FanMode; 2], HardwareError> {
+        let _timing = crate::timing::scope("mode_audit");
+        let read = |channel| {
+            FanMode::from_sysfs(&read_trimmed(&self.mode_path(channel)?, "audit fan mode")?)
+        };
+        Ok([read(1)?, read(2)?])
     }
 
     /// Emergency mode verification must not depend on optional PWM/RPM reads.
@@ -569,6 +630,20 @@ impl AcerHardware {
         parse_value(&path, "temperature")
     }
 
+    pub(crate) fn fan_telemetry_identity(&self) -> Vec<(PathBuf, u64, u64)> {
+        self.hwmon
+            .iter()
+            .cloned()
+            .chain((1..=2).filter_map(|channel| self.mode_path(channel).ok()))
+            .map(|path| {
+                let metadata = fs::metadata(&path).ok();
+                let device = metadata.as_ref().map_or(0, |m| m.dev());
+                let inode = metadata.as_ref().map_or(0, |m| m.ino());
+                (path, device, inode)
+            })
+            .collect()
+    }
+
     pub fn refresh_telemetry_interfaces(&mut self) {
         // Module loading/reloading can introduce or renumber optional hwmon nodes.
         self.hwmon = discover_acer_hwmon(&self.root);
@@ -578,12 +653,26 @@ impl AcerHardware {
         &self.root
     }
 
-    fn read_fan_channel(&self, channel: u8) -> Result<FanChannelState, HardwareError> {
-        let rpm = self.read_rpm(channel).unwrap_or(0);
+    fn read_fan_channel(
+        &self,
+        channel: u8,
+        include_rpm: bool,
+    ) -> Result<FanChannelState, HardwareError> {
+        let rpm = if include_rpm {
+            self.read_rpm(channel).unwrap_or(0)
+        } else {
+            0
+        };
         let (mode, pwm_raw) = match &self.fan_backend {
             Some(FanInterface::KernelPwm { base }) => {
-                let mode = read_optional_fan_mode(&base.join(format!("pwm{channel}_enable")))?;
-                let pwm: u32 = parse_value(&base.join(format!("pwm{channel}")), "PWM")?;
+                let mode = {
+                    let _timing = crate::timing::scope("mode_read");
+                    read_optional_fan_mode(&base.join(format!("pwm{channel}_enable")))?
+                };
+                let pwm: u32 = {
+                    let _timing = crate::timing::scope("speed_read");
+                    parse_value(&base.join(format!("pwm{channel}")), "PWM")?
+                };
                 let pwm_raw = u8::try_from(pwm).map_err(|_| HardwareError::InvalidValue {
                     field: "PWM",
                     value: pwm.to_string(),
@@ -592,11 +681,15 @@ impl AcerHardware {
             }
             Some(FanInterface::AcerGamingWmi { base, manual }) => {
                 let role = fan_role(channel)?;
-                let mode = FanMode::from_sysfs(&read_trimmed(
-                    &base.join(format!("{role}_mode")),
-                    "read Gaming-WMI fan mode",
-                )?)?;
+                let mode = {
+                    let _timing = crate::timing::scope("mode_read");
+                    FanMode::from_sysfs(&read_trimmed(
+                        &base.join(format!("{role}_mode")),
+                        "read Gaming-WMI fan mode",
+                    )?)?
+                };
                 let percent = if *manual {
+                    let _timing = crate::timing::scope("speed_read");
                     let value: u8 =
                         parse_value(&base.join(format!("{role}_speed")), "Gaming-WMI fan speed")?;
                     if value > 100 {
@@ -713,12 +806,14 @@ impl AcerHardware {
     }
 
     fn verify_mode(&self, channel: u8, expected: FanMode) -> Result<(), HardwareError> {
+        let _timing = crate::timing::scope("mode_verify");
         let path = self.mode_path(channel)?;
         let actual = read_trimmed(&path, "verify fan mode")?;
         ensure_readback("pwm_enable", expected.as_sysfs(), &actual)
     }
 
     fn write_speed_percent(&self, channel: u8, percent: u8) -> Result<(), HardwareError> {
+        let _timing = crate::timing::scope("speed_write");
         let (path, value) = match &self.fan_backend {
             Some(FanInterface::KernelPwm { base }) => (
                 base.join(format!("pwm{channel}")),
@@ -739,6 +834,7 @@ impl AcerHardware {
     }
 
     fn verify_pwm_percent(&self, channel: u8, expected_percent: u8) -> Result<(), HardwareError> {
+        let _timing = crate::timing::scope("speed_verify");
         let path = match &self.fan_backend {
             Some(FanInterface::KernelPwm { base }) => base.join(format!("pwm{channel}")),
             Some(FanInterface::AcerGamingWmi { base, manual: true }) => {
@@ -1218,6 +1314,28 @@ mod tests {
     }
 
     #[test]
+    fn control_readback_is_independent_of_optional_rpm_and_still_tracks_overrides() {
+        let fixture = Fixture::new();
+        let hardware = AcerHardware::discover_at(&fixture.root).unwrap();
+        // Unreadable RPM must not enter the controller's mode/PWM readback path.
+        fs::remove_file(fixture.hwmon().join("fan1_input")).unwrap();
+        fs::create_dir(fixture.hwmon().join("fan1_input")).unwrap();
+        fs::write(fixture.hwmon().join("pwm1_enable"), "1").unwrap();
+        fs::write(fixture.hwmon().join("pwm1"), "128").unwrap();
+        let state = hardware.read_fan_control_state().unwrap();
+        assert_eq!(state.cpu.mode, Some(FanMode::Manual));
+        assert_eq!(state.cpu.pwm_raw, 128);
+        assert_eq!(state.cpu.rpm, 0);
+        fs::write(fixture.hwmon().join("pwm1_enable"), "2").unwrap();
+        assert_eq!(
+            hardware.read_fan_control_state().unwrap().cpu.mode,
+            Some(FanMode::Automatic)
+        );
+        fs::remove_file(fixture.hwmon().join("pwm1_enable")).unwrap();
+        assert!(hardware.read_fan_control_state().is_err());
+    }
+
+    #[test]
     fn discovers_acer_by_name_not_hwmon_number() {
         let fixture = Fixture::new();
         let other = fixture.root.join("sys/class/hwmon/hwmon8");
@@ -1579,6 +1697,26 @@ mod tests {
         assert_eq!(fans.backend, Some(FanBackend::AcerGamingWmi));
         assert!(fans.auto && fans.maximum);
         assert!(fans.manual);
+    }
+
+    #[test]
+    fn gaming_wmi_speed_update_only_writes_the_changed_channel() {
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.hwmon().join("pwm2_enable")).unwrap();
+        let base = fixture.gaming_fan(true);
+        let hardware = AcerHardware::discover_at(&fixture.root).unwrap();
+        // Any mode or speed read would now fail; the kernel store verifies writes.
+        for name in ["cpu_mode", "gpu_mode"] {
+            fs::remove_file(base.join(name)).unwrap();
+            fs::create_dir(base.join(name)).unwrap();
+        }
+        fs::write(base.join("gpu_speed"), "unread-sentinel").unwrap();
+        hardware.update_manual_fan_channels(Some(70), None).unwrap();
+        assert_eq!(fs::read_to_string(base.join("cpu_speed")).unwrap(), "70");
+        assert_eq!(
+            fs::read_to_string(base.join("gpu_speed")).unwrap(),
+            "unread-sentinel"
+        );
     }
 
     #[test]

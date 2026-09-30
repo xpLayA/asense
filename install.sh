@@ -285,23 +285,55 @@ inspect_wmi_endpoints() {
 }
 
 ping_control_service() {
-  asense_as_target python3 - <<'PY'
+  if ! asense_as_target python3 - <<'PY'
 import re
 import socket
+import time
 
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.settimeout(5.0)
-client.connect("/run/asense-control.sock")
-reader = client.makefile("rb")
-client.sendall(b"HELLO 2\n")
-handshake = reader.readline(4097)
-if re.fullmatch(rb"OK protocol=2 daemon=[^ \r\n]+\n", handshake) is None:
-    raise SystemExit(f"unexpected ASense protocol handshake: {handshake!r}")
-client.sendall(b"PING\n")
-response = reader.readline(4097)
-if response != b"OK ready\n":
-    raise SystemExit(f"unexpected ASense control response: {response!r}")
+# Firmware may still be restoring a saved curve during startup or ExecReload.
+# Use one absolute deadline for connect, handshake, and ping.
+deadline = time.monotonic() + 30.0
+
+def remaining():
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise TimeoutError("startup deadline expired")
+    return value
+
+def read_response(client):
+    line = bytearray()
+    while len(line) < 4097:
+        client.settimeout(remaining())
+        byte = client.recv(1)
+        if not byte:
+            break
+        line.extend(byte)
+        if byte == b"\n":
+            break
+    return bytes(line)
+
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(remaining())
+        client.connect("/run/asense-control.sock")
+        client.settimeout(remaining())
+        client.sendall(b"HELLO 2\n")
+        handshake = read_response(client)
+        if re.fullmatch(rb"OK protocol=2 daemon=[^ \r\n]+\n", handshake) is None:
+            raise SystemExit(f"unexpected ASense protocol handshake: {handshake!r}")
+        client.settimeout(remaining())
+        client.sendall(b"PING\n")
+        response = read_response(client)
+        if response != b"OK ready\n":
+            raise SystemExit(f"unexpected ASense control response: {response!r}")
+except OSError as error:
+    raise SystemExit(f"ASense control health check failed within the 30-second startup window: {error}") from None
 PY
+  then
+    asense_root systemctl status asense.service asense.socket --no-pager >&2 || true
+    asense_root journalctl -u asense.service -n 30 --no-pager >&2 || true
+    asense_die "ASense control health check failed; see service diagnostics above"
+  fi
   asense_root systemctl is-active --quiet asense.service ||
     asense_die "socket activation did not leave asense.service active"
 }

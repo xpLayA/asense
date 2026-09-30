@@ -7,7 +7,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hardware::{AcerHardware, FanMode, FanSetting};
+use crate::hardware::{AcerHardware, FanMode, FanSetting, HardwareError};
+
+/// Unchanged Manual targets are re-read from firmware this often. Each audit
+/// costs four ~15 ms Gaming-WMI calls, so an external Fn/Predator-key override
+/// can take up to this long to be repaired; thermal checks still run at 1 Hz.
+const CONTROL_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
+/// Confirmed emergency Maximum is rare and safety-critical: audit it sooner.
+const EMERGENCY_AUDIT_INTERVAL: Duration = Duration::from_secs(5);
 use crate::mutation_lock::MutationGuard;
 use crate::nvidia::{NvidiaController, NvidiaRuntimeStatus, discover_nvidia_pci_device};
 
@@ -340,19 +347,17 @@ trait TemperatureSession {
 impl TemperatureSession for NvidiaController {
     fn sample(&self) -> (Result<f32, String>, bool, bool) {
         let temperature = self.temperature();
-        let live = self.live_telemetry();
-        let lost = live.session_lost
-            || temperature
-                .as_ref()
-                .err()
-                .is_some_and(|e| e.invalidates_session());
+        let lost = temperature
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.invalidates_session());
         let result = temperature.map_err(|e| e.to_string()).and_then(|value| {
             value
                 .filter(|v| *v <= 120)
                 .map(|v| v as f32)
                 .ok_or_else(|| "NVML temperature missing or invalid".into())
         });
-        (result, lost, live.is_runtime_idle())
+        (result, lost, false)
     }
 }
 type OpenTemperatureSession =
@@ -423,6 +428,7 @@ impl TemperatureSampler {
             self.invalidate();
         }
         self.last_sample = Some(now);
+        let _timing = crate::timing::scope("temperature_sample");
         let root = hardware.root();
         let valid = |v: f32| v.is_finite() && (0.0..=120.0).contains(&v);
         let acer = |channel| -> Result<f32, String> {
@@ -533,25 +539,59 @@ pub struct CurveStatus {
     pub fault: Option<String>,
 }
 
+/// Round software-curve targets upward; explicit Manual requests remain exact.
+fn curve_speed_step(percent: u8) -> u8 {
+    percent.min(100).div_ceil(5) * 5
+}
+
+/// Decreases are computed as if the sensor were this much hotter, so idle
+/// jitter around a curve step cannot toggle the fan target.
+const DECREASE_HYSTERESIS_C: f32 = 3.0;
+/// Rises of at least this many points (or to 100%) apply on the first sample;
+/// smaller rises must be requested by two consecutive fresh samples.
+const IMMEDIATE_RISE_POINTS: u8 = 15;
+const DECREASE_DELAY: Duration = Duration::from_secs(15);
+const MAX_DECREASE_POINTS: u8 = 20;
+
+/// Every target change costs several ~15 ms firmware calls that can stall
+/// input handling, so the ramp favors few, larger, cooling-biased changes.
 #[derive(Default)]
 struct Ramp {
     current: Option<u8>,
+    rise_pending: bool,
     lower_since: Option<Instant>,
 }
 
 impl Ramp {
-    fn target(&mut self, desired: u8, now: Instant) -> u8 {
-        let current = self.current.unwrap_or(desired);
-        let next = if desired >= current {
+    /// `up` is the curve target at the measured temperature; `down` is the
+    /// target with decrease hysteresis applied (always `>= up`).
+    fn target(&mut self, up: u8, down: u8, now: Instant) -> u8 {
+        let Some(current) = self.current else {
+            self.current = Some(up);
+            return up;
+        };
+        let next = if up > current {
             self.lower_since = None;
-            desired
-        } else {
+            if self.rise_pending || up >= 100 || up - current >= IMMEDIATE_RISE_POINTS {
+                self.rise_pending = false;
+                up
+            } else {
+                self.rise_pending = true;
+                current
+            }
+        } else if down < current {
+            self.rise_pending = false;
             let since = *self.lower_since.get_or_insert(now);
-            if now.duration_since(since) >= Duration::from_secs(5) {
-                desired.max(current.saturating_sub(5))
+            if now.duration_since(since) >= DECREASE_DELAY {
+                self.lower_since = Some(now);
+                down.max(current.saturating_sub(MAX_DECREASE_POINTS))
             } else {
                 current
             }
+        } else {
+            self.rise_pending = false;
+            self.lower_since = None;
+            current
         };
         self.current = Some(next);
         next
@@ -573,6 +613,9 @@ pub(crate) struct CurveRuntime {
     sensor_fault_since: Option<Instant>,
     sensor_fallback: bool,
     last_processed_sample: Option<Instant>,
+    verified_manual: Option<[u8; 2]>,
+    maximum_verified: bool,
+    next_audit: Instant,
 }
 
 impl CurveRuntime {
@@ -602,6 +645,9 @@ impl CurveRuntime {
             sensor_fault_since: None,
             sensor_fallback: false,
             last_processed_sample: None,
+            verified_manual: None,
+            maximum_verified: false,
+            next_audit: Instant::now(),
         }
     }
 
@@ -612,12 +658,50 @@ impl CurveRuntime {
         self.status.state = "unavailable".into();
         self.status.fault = Some(error);
         self.status.requested = None;
+        self.invalidate_control();
     }
 
     pub fn reset(&mut self) {
         self.next_tick = Instant::now();
         self.status.requested = None;
         self.ramps = [Ramp::default(), Ramp::default()];
+        self.invalidate_control();
+    }
+
+    fn invalidate_control(&mut self) {
+        self.verified_manual = None;
+        self.maximum_verified = false;
+        self.next_audit = Instant::now();
+    }
+
+    fn ensure_maximum(
+        &mut self,
+        hardware: &AcerHardware,
+        now: Instant,
+    ) -> Result<(), HardwareError> {
+        let result = (|| {
+            if self.maximum_verified {
+                if now < self.next_audit {
+                    return Ok(());
+                }
+                if hardware
+                    .read_fan_modes()
+                    .is_ok_and(|modes| modes == [FanMode::Maximum; 2])
+                {
+                    self.next_audit = now + EMERGENCY_AUDIT_INTERVAL;
+                    return Ok(());
+                }
+            }
+            hardware.apply_maximum_failsafe()?;
+            self.verified_manual = None;
+            self.maximum_verified = true;
+            self.next_audit = now + EMERGENCY_AUDIT_INTERVAL;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.invalidate_control();
+        }
+        result
     }
 
     pub fn disable(&mut self, path: &Path) -> Result<(), String> {
@@ -648,7 +732,8 @@ impl CurveRuntime {
         let targets = [
             interpolate(&config.cpu, cpu),
             gpu.map_or(config.gpu[0].percent, |t| interpolate(&config.gpu, t)),
-        ];
+        ]
+        .map(curve_speed_step);
         hardware
             .apply_fan_setting(FanSetting::Manual {
                 cpu_percent: targets[0],
@@ -667,6 +752,8 @@ impl CurveRuntime {
         self.limits = limits;
         self.last_reading = Some(reading);
         self.status.requested = Some(targets);
+        self.verified_manual = Some(targets);
+        self.next_audit = Instant::now() + CONTROL_AUDIT_INTERVAL;
         self.ramps[0].current = Some(targets[0]);
         self.ramps[1].current = Some(targets[1]);
         self.status.state = "running".into();
@@ -679,8 +766,10 @@ impl CurveRuntime {
         if !self.status.config.enabled || now < self.next_tick {
             return;
         }
+        let _timing = crate::timing::scope("curve_tick");
         self.next_tick = now + Duration::from_secs(1);
         if Path::new(PAUSE_PATH).exists() {
+            self.invalidate_control();
             sampler.invalidate();
             self.paused = true;
             self.status.state = "paused".into();
@@ -694,11 +783,13 @@ impl CurveRuntime {
         self.last_tick = now;
         let result = MutationGuard::acquire()
             .inspect_err(|_| {
+                self.invalidate_control();
                 self.status.state = "control-fault".into();
             })
             .and_then(|_guard| {
                 // Recheck under the lock: suspend may have begun while waiting.
                 if Path::new(PAUSE_PATH).exists() {
+                    self.invalidate_control();
                     self.paused = true;
                     self.status.state = "paused".into();
                     return Ok(());
@@ -715,6 +806,7 @@ impl CurveRuntime {
         } else if self.status.state == "running" {
             self.logged_fault = None;
         }
+        crate::timing::context(&self.status.state, self.status.requested);
     }
 
     pub(crate) fn set_limits(&mut self, limits: EmergencyConfig) {
@@ -757,7 +849,8 @@ impl CurveRuntime {
             self.emergency_reason = Some(error.clone());
             self.safe_samples = 0;
             self.status.state = "emergency".into();
-            match hardware.apply_maximum_failsafe() {
+            crate::timing::context("emergency", Some([100, 100]));
+            match self.ensure_maximum(hardware, now) {
                 Ok(()) => self.status.requested = Some([100, 100]),
                 Err(e) => {
                     self.status.state = "control-fault".into();
@@ -775,14 +868,11 @@ impl CurveRuntime {
                 self.safe_samples = 0;
             }
             if self.safe_samples < 5 {
-                // Retry an unconfirmed emergency transition at the bounded tick rate.
-                if self.status.requested != Some([100, 100]) || self.status.state == "control-fault"
-                {
-                    hardware
-                        .apply_maximum_failsafe()
-                        .map_err(|e| format!("Maximum failed: {e}"))?;
-                    self.status.requested = Some([100, 100]);
-                }
+                self.ensure_maximum(hardware, now).map_err(|e| {
+                    self.status.state = "control-fault".into();
+                    format!("Maximum failed: {e}")
+                })?;
+                self.status.requested = Some([100, 100]);
                 self.status.state = "emergency".into();
                 return Ok(());
             }
@@ -830,48 +920,68 @@ impl CurveRuntime {
                 self.ramps = [Ramp::default(), Ramp::default()];
             }
         }
-        let desired = [
-            reading
-                .cpu
-                .as_ref()
-                .map_or(80, |cpu| interpolate(&self.status.config.cpu, *cpu)),
-            reading.gpu.as_ref().map_or(80, |gpu| {
-                gpu.map_or(self.status.config.gpu[0].percent, |t| {
-                    interpolate(&self.status.config.gpu, t)
-                })
-            }),
-        ];
+        let curve_targets = |offset: f32| {
+            [
+                reading.cpu.as_ref().map_or(80, |cpu| {
+                    interpolate(&self.status.config.cpu, *cpu + offset)
+                }),
+                reading.gpu.as_ref().map_or(80, |gpu| {
+                    gpu.map_or(self.status.config.gpu[0].percent, |t| {
+                        interpolate(&self.status.config.gpu, t + offset)
+                    })
+                }),
+            ]
+            .map(curve_speed_step)
+        };
+        let desired = curve_targets(0.0);
         let mut targets = if fallback {
             [desired[0].max(80), desired[1].max(80)]
         } else {
+            let down = curve_targets(DECREASE_HYSTERESIS_C);
             [
-                self.ramps[0].target(desired[0], now),
-                self.ramps[1].target(desired[1], now),
+                self.ramps[0].target(desired[0], down[0], now),
+                self.ramps[1].target(desired[1], down[1], now),
             ]
         };
-        let applied = hardware.read_fan_state().and_then(|state| {
-            let manual =
-                state.cpu.mode == Some(FanMode::Manual) && state.gpu.mode == Some(FanMode::Manual);
-            if !manual {
+        crate::timing::context(&self.status.state, Some(targets));
+        let applied = (|| -> Result<(), HardwareError> {
+            if self.verified_manual.is_none() || now >= self.next_audit {
+                let state = hardware.read_fan_control_state()?;
+                self.next_audit = now + CONTROL_AUDIT_INTERVAL;
+                self.verified_manual = if state.cpu.mode == Some(FanMode::Manual)
+                    && state.gpu.mode == Some(FanMode::Manual)
+                {
+                    Some([
+                        crate::hardware::pwm_to_percent(state.cpu.pwm_raw),
+                        crate::hardware::pwm_to_percent(state.gpu.pwm_raw),
+                    ])
+                } else {
+                    None
+                };
+            }
+            if let Some(previous) = self.verified_manual {
+                if previous != targets {
+                    hardware.update_manual_fan_channels(
+                        (previous[0] != targets[0]).then_some(targets[0]),
+                        (previous[1] != targets[1]).then_some(targets[1]),
+                    )?;
+                }
+            } else {
                 if !fallback {
                     targets = desired;
                 }
-                hardware
-                    .apply_fan_setting(FanSetting::Manual {
-                        cpu_percent: targets[0],
-                        gpu_percent: targets[1],
-                    })
-                    .map(|_| ())
-            } else if self.status.requested != Some(targets)
-                || crate::hardware::pwm_to_percent(state.cpu.pwm_raw) != targets[0]
-                || crate::hardware::pwm_to_percent(state.gpu.pwm_raw) != targets[1]
-            {
-                hardware.update_manual_fan_speeds(targets[0], targets[1])
-            } else {
-                Ok(())
+                hardware.apply_fan_setting(FanSetting::Manual {
+                    cpu_percent: targets[0],
+                    gpu_percent: targets[1],
+                })?;
+                self.next_audit = now + CONTROL_AUDIT_INTERVAL;
             }
-        });
+            self.verified_manual = Some(targets);
+            self.maximum_verified = false;
+            Ok(())
+        })();
         if let Err(error) = applied {
+            self.invalidate_control();
             self.status.state = "control-fault".into();
             // Maximum is an independent best-effort hardware safety action,
             // not a temperature diagnosis. Only record it after mode readback.
@@ -958,6 +1068,415 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn explicit_manual_percentages_are_not_quantized() {
+        let f = Fixture::new();
+        let state = f
+            .hardware
+            .apply_fan_setting(FanSetting::Manual {
+                cpu_percent: 31,
+                gpu_percent: 43,
+            })
+            .unwrap();
+        assert_eq!(crate::hardware::pwm_to_percent(state.cpu.pwm_raw), 31);
+        assert_eq!(crate::hardware::pwm_to_percent(state.gpu.pwm_raw), 43);
+    }
+
+    #[test]
+    fn curve_speed_steps_round_up_without_exceeding_maximum() {
+        for percent in 0..=100 {
+            let stepped = curve_speed_step(percent);
+            assert!(stepped >= percent && stepped <= 100);
+            assert!(stepped - percent < 5);
+            assert_eq!(stepped % 5, 0);
+        }
+        assert_eq!(curve_speed_step(31), 35);
+        assert_eq!(curve_speed_step(96), 100);
+    }
+
+    #[test]
+    fn activation_and_ticks_use_same_rounded_targets_and_preserve_points() {
+        let f = Fixture::new();
+        fs::write(f.hwmon().join("temp1_input"), "66000").unwrap();
+        fs::write(f.hwmon().join("temp2_input"), "51000").unwrap();
+        let mut runtime = f.runtime();
+        let mut config = runtime.status.config.clone();
+        for point in &mut config.cpu[..4] {
+            point.percent += 1;
+        }
+        runtime
+            .activate(
+                config.clone(),
+                &f.hardware,
+                &f.config_path(),
+                &mut TemperatureSampler::default(),
+            )
+            .unwrap();
+        assert_eq!(runtime.status.requested, Some([65, 45]));
+        assert_eq!(CurveConfig::load(&f.config_path()).unwrap(), config);
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((66.0, Some(51.0))), now)
+            .unwrap();
+        assert_eq!(runtime.status.requested, Some([65, 45]));
+        runtime
+            .step(
+                &f.hardware,
+                Ok((67.0, Some(52.0))),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(runtime.status.requested, Some([65, 45]));
+        runtime
+            .step(
+                &f.hardware,
+                Ok((68.0, Some(53.0))),
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+        // A five-point rise is debounced for one sample.
+        assert_eq!(runtime.status.requested, Some([65, 45]));
+        runtime
+            .step(
+                &f.hardware,
+                Ok((68.0, Some(53.0))),
+                now + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(runtime.status.requested, Some([70, 50]));
+    }
+
+    #[test]
+    fn cooldown_makes_few_large_decreases_and_large_rises_are_immediate() {
+        let now = Instant::now();
+        let mut ramp = Ramp::default();
+        assert_eq!(ramp.target(80, 80, now), 80);
+        let mut changes = 0;
+        let mut previous = 80;
+        for second in 0..=45 {
+            let target = ramp.target(30, 30, now + Duration::from_secs(second));
+            let expected = 80 - (second / 15) as u8 * MAX_DECREASE_POINTS;
+            assert_eq!(target, expected.max(30));
+            changes += u32::from(target != previous);
+            previous = target;
+        }
+        assert_eq!(previous, 30);
+        assert_eq!(changes, 3);
+        assert_eq!(ramp.target(95, 95, now + Duration::from_secs(46)), 95);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(47)), 95);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(61)), 95);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(62)), 75);
+    }
+
+    #[test]
+    fn small_rises_need_two_consecutive_samples_and_maximum_is_immediate() {
+        let now = Instant::now();
+        let mut ramp = Ramp::default();
+        assert_eq!(ramp.target(40, 40, now), 40);
+        assert_eq!(ramp.target(45, 50, now + Duration::from_secs(1)), 40);
+        assert_eq!(ramp.target(40, 45, now + Duration::from_secs(2)), 40);
+        assert_eq!(ramp.target(45, 50, now + Duration::from_secs(3)), 40);
+        assert_eq!(ramp.target(50, 50, now + Duration::from_secs(4)), 50);
+        assert_eq!(ramp.target(55, 60, now + Duration::from_secs(5)), 50);
+        assert_eq!(ramp.target(100, 100, now + Duration::from_secs(6)), 100);
+    }
+
+    #[test]
+    fn idle_jitter_around_a_curve_step_causes_no_fan_writes() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((52.0, Some(47.0))), now)
+            .unwrap();
+        let requested = runtime.status.requested;
+        let pwm = [1, 2].map(|channel| {
+            fs::metadata(f.hwmon().join(format!("pwm{channel}")))
+                .unwrap()
+                .modified()
+                .unwrap()
+        });
+        // ±2 °C around the 50/55 °C boundaries, alternating every second.
+        for second in 1..CONTROL_AUDIT_INTERVAL.as_secs() {
+            let offset = if second % 2 == 0 { 2.0 } else { -2.0 };
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((52.0 + offset, Some(47.0 + offset))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+            assert_eq!(runtime.status.requested, requested);
+        }
+        for (channel, modified) in [1, 2].into_iter().zip(pwm) {
+            assert_eq!(
+                fs::metadata(f.hwmon().join(format!("pwm{channel}")))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                modified
+            );
+        }
+    }
+
+    #[test]
+    fn changed_channel_write_failure_triggers_control_fault_before_audit() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        fs::remove_file(f.hwmon().join("pwm1")).unwrap();
+        fs::create_dir(f.hwmon().join("pwm1")).unwrap();
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((70.0, Some(50.0))),
+                    now + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.status.state, "control-fault");
+        assert!(runtime.verified_manual.is_none());
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
+    }
+
+    #[test]
+    fn emergency_audit_repairs_external_mode_override() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        assert!(
+            runtime
+                .step(&f.hardware, Ok((95.0, Some(50.0))), now)
+                .is_err()
+        );
+        fs::write(f.hwmon().join("pwm2_enable"), "2").unwrap();
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(4)
+                )
+                .is_err()
+        );
+        assert_eq!(f.hardware.read_fan_modes().unwrap()[1], FanMode::Automatic);
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(5)
+                )
+                .is_err()
+        );
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
+    }
+
+    #[test]
+    fn unchanged_ticks_skip_readback_until_audit() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        fs::write(f.hwmon().join("pwm1"), "invalid").unwrap();
+        for second in 1..CONTROL_AUDIT_INTERVAL.as_secs() {
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((60.0, Some(50.0))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+            assert_eq!(runtime.status.state, "running");
+        }
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((60.0, Some(50.0))),
+                    now + CONTROL_AUDIT_INTERVAL
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.status.state, "control-fault");
+        assert!(runtime.verified_manual.is_none());
+    }
+
+    #[test]
+    fn rising_targets_update_only_changed_channel_before_audit() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        // If the GPU speed were read, verified, or rewritten, this sentinel would fail or change.
+        fs::write(f.hwmon().join("pwm2"), "external-override").unwrap();
+        runtime
+            .step(
+                &f.hardware,
+                Ok((70.0, Some(50.0))),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(runtime.status.requested, Some([70, 40]));
+        assert_eq!(
+            fs::read_to_string(f.hwmon().join("pwm2")).unwrap(),
+            "external-override"
+        );
+        assert_eq!(runtime.next_audit, now + CONTROL_AUDIT_INTERVAL);
+    }
+
+    #[test]
+    fn external_mode_override_is_repaired_at_audit_and_reset_forces_immediate_check() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        f.hardware.apply_fan_setting(FanSetting::Automatic).unwrap();
+        runtime
+            .step(
+                &f.hardware,
+                Ok((60.0, Some(50.0))),
+                now + CONTROL_AUDIT_INTERVAL - Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            f.hardware.read_fan_modes().unwrap(),
+            [FanMode::Automatic; 2]
+        );
+        runtime
+            .step(
+                &f.hardware,
+                Ok((60.0, Some(50.0))),
+                now + CONTROL_AUDIT_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Manual; 2]);
+        f.hardware.apply_fan_setting(FanSetting::Automatic).unwrap();
+        runtime.reset();
+        runtime
+            .step(
+                &f.hardware,
+                Ok((60.0, Some(50.0))),
+                now + CONTROL_AUDIT_INTERVAL + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Manual; 2]);
+    }
+
+    #[test]
+    fn partial_writes_do_not_postpone_external_speed_audits() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        fs::write(f.hwmon().join("pwm2"), "0").unwrap();
+        for second in 1..5 {
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((60.0 + second as f32, Some(50.0))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+            assert_eq!(fs::read_to_string(f.hwmon().join("pwm2")).unwrap(), "0");
+        }
+        runtime
+            .step(
+                &f.hardware,
+                Ok((65.0, Some(50.0))),
+                now + CONTROL_AUDIT_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::hardware::pwm_to_percent(
+                f.hardware.read_fan_control_state().unwrap().gpu.pwm_raw
+            ),
+            40
+        );
+    }
+
+    #[test]
+    fn emergency_is_immediate_and_confirmed_maximum_is_audited_without_pwm() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
+            .unwrap();
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
+        // No redundant Maximum commands between audits, even with an unavailable mode node.
+        fs::remove_file(f.hwmon().join("pwm2_enable")).unwrap();
+        for second in 2..6 {
+            assert!(
+                runtime
+                    .step(
+                        &f.hardware,
+                        Ok((95.0, Some(50.0))),
+                        now + Duration::from_secs(second)
+                    )
+                    .is_err()
+            );
+            assert_eq!(runtime.status.state, "emergency");
+        }
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(6)
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.status.state, "control-fault");
+        assert!(!runtime.maximum_verified);
+        fs::write(f.hwmon().join("pwm2_enable"), "2").unwrap();
+        fs::remove_file(f.hwmon().join("pwm1")).unwrap();
+        fs::remove_file(f.hwmon().join("pwm2")).unwrap();
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(7)
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.status.state, "emergency");
+        assert!(runtime.maximum_verified);
+        assert!(
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((95.0, Some(50.0))),
+                    now + Duration::from_secs(12)
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.status.state, "emergency");
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
     }
 
     #[test]
@@ -1511,13 +2030,18 @@ mod tests {
     fn failed_readback_reports_control_fault() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
+        let now = Instant::now();
         runtime
-            .step(&f.hardware, Ok((60.0, Some(50.0))), Instant::now())
+            .step(&f.hardware, Ok((60.0, Some(50.0))), now)
             .unwrap();
         fs::write(f.hwmon().join("pwm1"), "invalid").unwrap();
         assert!(
             runtime
-                .step(&f.hardware, Ok((65.0, Some(55.0))), Instant::now())
+                .step(
+                    &f.hardware,
+                    Ok((60.0, Some(50.0))),
+                    now + CONTROL_AUDIT_INTERVAL
+                )
                 .is_err()
         );
         assert!(!runtime.emergency);
@@ -1704,12 +2228,15 @@ mod tests {
     fn cooling_waits_then_limits_each_decrease() {
         let now = Instant::now();
         let mut ramp = Ramp::default();
-        assert_eq!(ramp.target(80, now), 80);
-        assert_eq!(ramp.target(30, now), 80);
-        assert_eq!(ramp.target(30, now + Duration::from_secs(4)), 80);
-        assert_eq!(ramp.target(30, now + Duration::from_secs(5)), 75);
-        assert_eq!(ramp.target(90, now + Duration::from_secs(6)), 90);
-        assert_eq!(ramp.target(30, now + Duration::from_secs(7)), 90);
+        assert_eq!(ramp.target(80, 80, now), 80);
+        assert_eq!(ramp.target(30, 30, now), 80);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(14)), 80);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(15)), 60);
+        assert_eq!(ramp.target(90, 90, now + Duration::from_secs(16)), 90);
+        assert_eq!(ramp.target(30, 30, now + Duration::from_secs(17)), 90);
+        // Hysteresis: a lower measured target alone does not start cooldown.
+        assert_eq!(ramp.target(85, 90, now + Duration::from_secs(40)), 90);
+        assert_eq!(ramp.target(85, 90, now + Duration::from_secs(60)), 90);
     }
     #[test]
     fn persistence_round_trip_and_invalid_file_preservation() {

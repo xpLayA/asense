@@ -1246,7 +1246,10 @@ fn Root() -> Element {
                 }
                 if hardware.is_none() {
                     match AcerHardware::discover() {
-                        Ok(discovered) => hardware = Some(discovered),
+                        Ok(discovered) => {
+                            reader.invalidate_fan_snapshot();
+                            hardware = Some(discovered);
+                        }
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             let retry_after = telemetry_retry_delay(consecutive_failures);

@@ -13,6 +13,13 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// RPM uses the cheap firmware sys-info query.
+const FAN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Mode/speed readback uses ~15 ms Gaming-WMI fan-behavior calls that can
+/// stall input handling, so the GUI refreshes them far less often.
+const FAN_CONTROL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 const HARDWARE_FREQUENCY_REFRESH_SAMPLES: u8 = 5;
 const NVIDIA_SLOW_REFRESH_SAMPLES: u8 = 10;
@@ -261,6 +268,16 @@ pub struct TelemetryReader {
     hardware_frequency_refresh: u8,
     nvidia_slow: NvidiaSlowTelemetry,
     nvidia_slow_refresh: u8,
+    fan_snapshot: Option<FanSnapshot>,
+}
+
+struct FanSnapshot {
+    root: PathBuf,
+    identity: Vec<(PathBuf, u64, u64)>,
+    next_refresh: Instant,
+    next_control_refresh: Instant,
+    channels: Vec<FanRpmChannel>,
+    fans: FanState,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -409,7 +426,53 @@ impl TelemetryReader {
             hardware_frequency_refresh: 0,
             nvidia_slow: NvidiaSlowTelemetry::default(),
             nvidia_slow_refresh: 0,
+            fan_snapshot: None,
         }
+    }
+
+    pub fn invalidate_fan_snapshot(&mut self) {
+        self.fan_snapshot = None;
+    }
+
+    fn sample_fans_at(
+        &mut self,
+        hardware: &AcerHardware,
+        now: Instant,
+    ) -> (Vec<FanRpmChannel>, FanState) {
+        let identity = hardware.fan_telemetry_identity();
+        if let Some(snapshot) = &self.fan_snapshot
+            && snapshot.root == hardware.root()
+            && snapshot.identity == identity
+            && now < snapshot.next_refresh
+        {
+            return (snapshot.channels.clone(), snapshot.fans);
+        }
+        let _timing = crate::timing::scope("ui_fan_snapshot");
+        let channels = hardware.fan_rpm_channels();
+        let rpm_state = unavailable_fan_state(&channels);
+        let cached_control = self.fan_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.root == hardware.root()
+                && snapshot.identity == identity
+                && now < snapshot.next_control_refresh)
+                .then_some((snapshot.fans, snapshot.next_control_refresh))
+        });
+        let (mut fans, next_control_refresh) = cached_control.unwrap_or_else(|| {
+            (
+                hardware.read_fan_control_state().unwrap_or(rpm_state),
+                now + FAN_CONTROL_REFRESH_INTERVAL,
+            )
+        });
+        fans.cpu.rpm = rpm_state.cpu.rpm;
+        fans.gpu.rpm = rpm_state.gpu.rpm;
+        self.fan_snapshot = Some(FanSnapshot {
+            root: hardware.root().to_path_buf(),
+            identity,
+            next_refresh: now + FAN_REFRESH_INTERVAL,
+            next_control_refresh,
+            channels: channels.clone(),
+            fans,
+        });
+        (channels, fans)
     }
 
     fn discover_nvidia(&mut self, pci_device: &NvidiaPciDevice, root: &Path) {
@@ -721,10 +784,7 @@ impl TelemetryReader {
             },
         };
 
-        let fan_rpm_channels = hardware.fan_rpm_channels();
-        let fans = hardware
-            .read_fan_state()
-            .unwrap_or_else(|_| unavailable_fan_state(&fan_rpm_channels));
+        let (fan_rpm_channels, fans) = self.sample_fans_at(hardware, Instant::now());
         let profile_raw = hardware.current_profile_raw().ok();
         let profile = profile_raw
             .as_deref()
@@ -1841,6 +1901,175 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+    fn cached_fan_fixture(label: &str) -> (PathBuf, AcerHardware) {
+        let root = minimal_acer_telemetry_fixture(label);
+        let hwmon = root.join("sys/class/hwmon/hwmon7");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("name"), "acer").unwrap();
+        fs::write(hwmon.join("fan1_input"), "2500").unwrap();
+        fs::write(hwmon.join("fan2_input"), "2300").unwrap();
+        let hardware = AcerHardware::discover_at(&root).unwrap();
+        (root, hardware)
+    }
+
+    #[test]
+    fn fan_snapshot_refreshes_on_deadline_and_keeps_all_rpm_fields_synchronized() {
+        let (root, hardware) = cached_fan_fixture("cached-fan-deadline");
+        let mut reader = offline_reader();
+        let now = Instant::now();
+        let (channels, fans) = reader.sample_fans_at(&hardware, now);
+        assert_eq!(channels[0].rpm, Some(fans.cpu.rpm));
+        assert_eq!(fans.cpu.rpm, 2500);
+        fs::write(root.join("sys/class/hwmon/hwmon7/fan1_input"), "4000").unwrap();
+        for second in 1..FAN_REFRESH_INTERVAL.as_secs() {
+            let (channels, fans) =
+                reader.sample_fans_at(&hardware, now + Duration::from_secs(second));
+            assert_eq!(channels[0].rpm, Some(2500));
+            assert_eq!(fans.cpu.rpm, 2500);
+        }
+        let (channels, fans) = reader.sample_fans_at(&hardware, now + FAN_REFRESH_INTERVAL);
+        assert_eq!(channels[0].rpm, Some(4000));
+        assert_eq!(fans.cpu.rpm, 4000);
+        assert_eq!(channels[1].rpm, Some(fans.gpu.rpm));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_mode_and_speed_refresh_less_often_than_rpm() {
+        let (root, _) = cached_fan_fixture("cached-fan-control");
+        let hwmon = root.join("sys/class/hwmon/hwmon7");
+        for (name, value) in [
+            ("pwm1", "128"),
+            ("pwm2", "128"),
+            ("pwm1_enable", "1"),
+            ("pwm2_enable", "1"),
+            ("temp1_input", "50000"),
+            ("temp2_input", "45000"),
+        ] {
+            fs::write(hwmon.join(name), value).unwrap();
+        }
+        let hardware = AcerHardware::discover_at(&root).unwrap();
+        let mut reader = offline_reader();
+        let now = Instant::now();
+        let (_, fans) = reader.sample_fans_at(&hardware, now);
+        assert_eq!(fans.cpu.mode, Some(crate::hardware::FanMode::Manual));
+        fs::write(hwmon.join("pwm1_enable"), "2").unwrap();
+        fs::write(hwmon.join("fan1_input"), "4000").unwrap();
+        let (_, fans) = reader.sample_fans_at(&hardware, now + FAN_REFRESH_INTERVAL);
+        assert_eq!(fans.cpu.rpm, 4000);
+        assert_eq!(fans.cpu.mode, Some(crate::hardware::FanMode::Manual));
+        let (_, fans) = reader.sample_fans_at(&hardware, now + FAN_CONTROL_REFRESH_INTERVAL);
+        assert_eq!(fans.cpu.mode, Some(crate::hardware::FanMode::Automatic));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_rpm_refresh_discards_old_reading_and_interface_removal_refreshes_immediately() {
+        let (root, hardware) = cached_fan_fixture("cached-fan-failure");
+        let mut reader = offline_reader();
+        let now = Instant::now();
+        reader.sample_fans_at(&hardware, now);
+        let hwmon = root.join("sys/class/hwmon/hwmon7");
+        fs::write(hwmon.join("fan1_input"), "invalid").unwrap();
+        let (channels, fans) = reader.sample_fans_at(&hardware, now + FAN_REFRESH_INTERVAL);
+        assert_eq!(channels[0].rpm, None);
+        assert_eq!(fans.cpu.rpm, 0);
+        assert_eq!(channels[1].rpm, Some(2300));
+        fs::remove_dir_all(hwmon).unwrap();
+        let (channels, fans) = reader.sample_fans_at(&hardware, now + Duration::from_secs(6));
+        assert!(channels.is_empty());
+        assert_eq!(fans, unavailable_fan_state(&[]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_snapshot_refreshes_after_module_renumbering_and_explicit_rediscovery() {
+        let (root, mut hardware) = cached_fan_fixture("cached-fan-reload");
+        let mut reader = offline_reader();
+        let now = Instant::now();
+        reader.sample_fans_at(&hardware, now);
+        let old = root.join("sys/class/hwmon/hwmon7");
+        let new = root.join("sys/class/hwmon/hwmon8");
+        fs::rename(old, &new).unwrap();
+        fs::write(new.join("fan1_input"), "5000").unwrap();
+        hardware.refresh_telemetry_interfaces();
+        assert_eq!(
+            reader
+                .sample_fans_at(&hardware, now + Duration::from_secs(1))
+                .1
+                .cpu
+                .rpm,
+            5000
+        );
+        fs::write(new.join("fan1_input"), "6000").unwrap();
+        reader.invalidate_fan_snapshot();
+        assert_eq!(
+            reader
+                .sample_fans_at(&hardware, now + Duration::from_secs(2))
+                .1
+                .cpu
+                .rpm,
+            6000
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_snapshot_opens_each_rpm_channel_once_and_cached_ticks_open_none() {
+        use std::os::fd::FromRawFd;
+        let (root, hardware) = cached_fan_fixture("cached-fan-open-count");
+        let hwmon = root.join("sys/class/hwmon/hwmon7");
+        let path = std::ffi::CString::new(hwmon.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: inotify returns a new owned fd; the watch path is a live CString.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(raw >= 0);
+        let mut events = unsafe { fs::File::from_raw_fd(raw) };
+        assert!(unsafe { libc::inotify_add_watch(raw, path.as_ptr(), libc::IN_OPEN) } >= 0);
+        let mut reader = offline_reader();
+        let now = Instant::now();
+        reader.sample_fans_at(&hardware, now);
+        let mut buffer = [0_u8; 4096];
+        let count = events.read(&mut buffer).unwrap();
+        let mut offset = 0;
+        let mut names = Vec::new();
+        while offset < count {
+            // SAFETY: kernel records have an inotify_event header, possibly unaligned.
+            let event = unsafe {
+                std::ptr::read_unaligned(buffer[offset..].as_ptr().cast::<libc::inotify_event>())
+            };
+            let start = offset + std::mem::size_of::<libc::inotify_event>();
+            let end = start + event.len as usize;
+            names.push(
+                buffer[start..end]
+                    .split(|byte| *byte == 0)
+                    .next()
+                    .unwrap()
+                    .to_vec(),
+            );
+            offset = end;
+        }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_slice() == b"fan1_input")
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_slice() == b"fan2_input")
+                .count(),
+            1
+        );
+        reader.sample_fans_at(&hardware, now + Duration::from_secs(1));
+        assert_eq!(
+            events.read(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn parses_cpu_aggregate_and_computes_interval_load() {
         let previous = parse_cpu_times("cpu  100 5 40 800 20 3 4 1 0 0\ncpu0 1 2 3\n").unwrap();
@@ -2372,6 +2601,7 @@ mod tests {
             hardware_frequency_refresh: 0,
             nvidia_slow: NvidiaSlowTelemetry::default(),
             nvidia_slow_refresh: 0,
+            fan_snapshot: None,
         };
         let initial = reader.hardware_snapshot(&root, 32_768, None);
         assert_eq!(initial.cpu.logical_processors, Some(4));
@@ -2567,6 +2797,7 @@ mod tests {
             hardware_frequency_refresh: 0,
             nvidia_slow: NvidiaSlowTelemetry::default(),
             nvidia_slow_refresh: 0,
+            fan_snapshot: None,
         }
     }
 

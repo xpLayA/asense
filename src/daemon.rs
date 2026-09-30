@@ -158,13 +158,27 @@ pub fn run() -> Result<(), String> {
         crate::fan_curve::EmergencyConfig::default()
     });
     let mut sampler = crate::fan_curve::TemperatureSampler::default();
+    let mut hardware_cache = None;
+    let mut was_paused = false;
+    let mut last_loop = Instant::now();
     loop {
+        let now = Instant::now();
+        let resumed_after_gap = now.duration_since(last_loop) > Duration::from_secs(3);
+        last_loop = now;
+        let paused = Path::new(PAUSE_PATH).exists();
+        if paused != was_paused || resumed_after_gap {
+            hardware_cache = None;
+        }
+        was_paused = paused;
         maintenance.poll_with_discovery();
         if curve.status.config.enabled {
-            match AcerHardware::discover() {
-                Ok(hardware) => curve.tick(&hardware, &mut sampler),
-                Err(error) => {
-                    curve.hardware_unavailable(format!("hardware discovery failed: {error}"))
+            if let Err(error) = cached_hardware(&mut hardware_cache, AcerHardware::discover) {
+                curve.hardware_unavailable(format!("hardware discovery failed: {error}"));
+            }
+            if let Some(hardware) = &hardware_cache {
+                curve.tick(hardware, &mut sampler);
+                if curve.status.state == "control-fault" {
+                    hardware_cache = None;
                 }
             }
         } else {
@@ -191,7 +205,13 @@ pub fn run() -> Result<(), String> {
         let (stream, _) = listener
             .accept()
             .map_err(|error| format!("accept failed: {error}"))?;
-        if let Err(error) = serve_client(stream, &mut maintenance, &mut curve, &mut sampler) {
+        if let Err(error) = serve_client(
+            stream,
+            &mut maintenance,
+            &mut curve,
+            &mut sampler,
+            &mut hardware_cache,
+        ) {
             eprintln!("asense daemon client error: {error}");
         }
     }
@@ -528,14 +548,78 @@ fn activated_listener() -> Result<UnixListener, String> {
     Ok(unsafe { UnixListener::from_raw_fd(3) })
 }
 
+/// Negotiate and answer startup health checks without probing firmware. Return
+/// the first ordinary command intact for the established control session.
+fn serve_control_preamble(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    decoder: &mut CommandDecoder,
+    protocol: &mut ProtocolSession,
+    mut maintenance: impl FnMut() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    loop {
+        let mut first_chunk = true;
+        let command = match decoder.read_with_maintenance(reader, || {
+            if first_chunk {
+                first_chunk = false;
+                Ok(())
+            } else {
+                maintenance()
+            }
+        }) {
+            Ok(Some(Ok(command))) => command,
+            Ok(Some(Err(error))) => {
+                write_response(writer, Err(error))?;
+                maintenance()?;
+                continue;
+            }
+            Ok(None) => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                maintenance()?;
+                continue;
+            }
+            Err(error) => return Err(format!("read failed: {error}")),
+        };
+        match protocol.accept(command.trim()) {
+            ProtocolAction::HandshakeAccepted(response) => write_response(writer, Ok(response))?,
+            ProtocolAction::HandshakeRejected(error) => {
+                write_response(writer, Err(error))?;
+                return Ok(None);
+            }
+            ProtocolAction::Dispatch if command.trim() == "PING" => {
+                write_response(writer, Ok("ready".into()))?
+            }
+            ProtocolAction::Dispatch => return Ok(Some(command)),
+        }
+        maintenance()?;
+    }
+}
+
+fn cached_hardware<T, E>(
+    cache: &mut Option<T>,
+    discover: impl FnOnce() -> Result<T, E>,
+) -> Result<&T, E> {
+    if cache.is_none() {
+        *cache = Some(discover()?);
+    }
+    Ok(cache
+        .as_ref()
+        .expect("successful discovery filled the cache"))
+}
+
 fn serve_client(
     mut stream: UnixStream,
     maintenance: &mut RuntimeMaintenance,
     curve: &mut CurveRuntime,
     sampler: &mut crate::fan_curve::TemperatureSampler,
+    hardware_cache: &mut Option<AcerHardware>,
 ) -> Result<(), String> {
     authorize_peer(&stream)?;
-    let mut hardware = AcerHardware::discover().map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| format!("set watchdog timeout: {error}"))?;
@@ -546,12 +630,41 @@ fn serve_client(
     let mut reader = BufReader::new(read_stream);
     let mut decoder = CommandDecoder::new();
     let mut protocol = ProtocolSession::new();
+    // Reply to health probes before optional firmware discovery/restoration.
+    // While an idle probe stays connected, cooling continues on read timeouts.
+    let mut prefetched = serve_control_preamble(
+        &mut reader,
+        &mut stream,
+        &mut decoder,
+        &mut protocol,
+        || {
+            if let Some(hardware) = hardware_cache.as_ref() {
+                curve.tick(hardware, sampler);
+            }
+            Ok(())
+        },
+    )?;
+    if prefetched.is_none() {
+        return Ok(());
+    }
+    let mut hardware = cached_hardware(hardware_cache, AcerHardware::discover)
+        .map_err(|error| error.to_string())?
+        .clone();
     let mut fan_session = FanSessionState::Automatic;
     let mut watchdog = ManualWatchdog::default();
     let mut session_maintenance_active = false;
+    let mut last_hardware_check = Instant::now();
+    let mut hardware_paused = Path::new(PAUSE_PATH).exists();
 
     let result = (|| -> Result<(), String> {
         loop {
+            refresh_curve_hardware(
+                &mut hardware,
+                curve,
+                sampler,
+                &mut last_hardware_check,
+                &mut hardware_paused,
+            )?;
             if session_maintenance_active {
                 maintenance.poll_with(&hardware);
             }
@@ -565,19 +678,31 @@ fn serve_client(
                     &curve.limits,
                 )?;
             }
-            let command = match decoder.read_with_maintenance(&mut reader, || {
-                curve.tick(&hardware, sampler);
-                if !curve.status.config.enabled {
-                    enforce_thermal_watchdog(
+            let incoming = if let Some(command) = prefetched.take() {
+                Ok(Some(Ok(command)))
+            } else {
+                decoder.read_with_maintenance(&mut reader, || {
+                    refresh_curve_hardware(
                         &mut hardware,
-                        &mut fan_session,
+                        curve,
                         sampler,
-                        &mut watchdog,
-                        &curve.limits,
+                        &mut last_hardware_check,
+                        &mut hardware_paused,
                     )?;
-                }
-                Ok(())
-            }) {
+                    curve.tick(&hardware, sampler);
+                    if !curve.status.config.enabled {
+                        enforce_thermal_watchdog(
+                            &mut hardware,
+                            &mut fan_session,
+                            sampler,
+                            &mut watchdog,
+                            &curve.limits,
+                        )?;
+                    }
+                    Ok(())
+                })
+            };
+            let command = match incoming {
                 Ok(Some(command)) => command,
                 Ok(None) => break Ok(()),
                 Err(error)
@@ -655,11 +780,43 @@ fn serve_client(
     if !curve.status.config.enabled {
         sampler.invalidate();
     }
+    *hardware_cache = if result.is_ok() && cleanup.is_ok() {
+        Some(hardware)
+    } else {
+        None
+    };
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
     }
+}
+
+/// Refresh a connected controller after resume or a failed firmware interface,
+/// without capability probes on healthy ticks or repeated GUI commands.
+fn refresh_curve_hardware(
+    hardware: &mut AcerHardware,
+    curve: &CurveRuntime,
+    sampler: &mut crate::fan_curve::TemperatureSampler,
+    checked: &mut Instant,
+    was_paused: &mut bool,
+) -> Result<(), String> {
+    let now = Instant::now();
+    let gap = now.duration_since(*checked);
+    if gap < Duration::from_secs(1) {
+        return Ok(());
+    }
+    *checked = now;
+    let paused = Path::new(PAUSE_PATH).exists();
+    let resumed = (*was_paused && !paused) || gap > Duration::from_secs(3);
+    *was_paused = paused;
+    if resumed || curve.status.state == "control-fault" {
+        *hardware = AcerHardware::discover().map_err(|error| error.to_string())?;
+        if resumed {
+            sampler.invalidate();
+        }
+    }
+    Ok(())
 }
 
 /// Fan ownership attached to one GUI control session.
@@ -1461,7 +1618,7 @@ fn enforce_thermal_watchdog(
     Ok(())
 }
 
-fn write_response(stream: &mut UnixStream, result: Result<String, String>) -> Result<(), String> {
+fn write_response(stream: &mut impl Write, result: Result<String, String>) -> Result<(), String> {
     let (prefix, payload) = match result {
         Ok(value) => ("OK", value),
         Err(error) => ("ERR", error),
@@ -1540,6 +1697,74 @@ mod tests {
     }
 
     #[test]
+    fn health_preamble_replies_without_hardware_and_preserves_first_control_command() {
+        let mut reader = std::io::Cursor::new(b"HELLO 2\nPING\nCAPS\n");
+        let mut output = Vec::new();
+        let mut calls = 0;
+        let command = super::serve_control_preamble(
+            &mut reader,
+            &mut output,
+            &mut super::CommandDecoder::new(),
+            &mut super::ProtocolSession::new(),
+            || {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(command.as_deref(), Some("CAPS"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("OK protocol=2 daemon="));
+        assert!(output.ends_with("OK ready\n"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn health_reply_is_written_before_slow_maintenance() {
+        let mut reader = std::io::Cursor::new(b"HELLO 2\nPING\n");
+        let mut output = Vec::new();
+        let mut calls = 0;
+        let result = super::serve_control_preamble(
+            &mut reader,
+            &mut output,
+            &mut super::CommandDecoder::new(),
+            &mut super::ProtocolSession::new(),
+            || {
+                calls += 1;
+                if calls == 2 {
+                    Err("firmware busy".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "firmware busy");
+        assert!(output.ends_with(b"OK ready\n"));
+    }
+
+    #[test]
+    fn hardware_cache_reuses_discovery_and_retries_after_failure_or_invalidation() {
+        let mut cache = None;
+        assert!(super::cached_hardware(&mut cache, || Err::<u32, _>("missing")).is_err());
+        assert_eq!(
+            *super::cached_hardware(&mut cache, || Ok::<_, &str>(1)).unwrap(),
+            1
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                *super::cached_hardware(&mut cache, || Err("discovery must not run")).unwrap(),
+                1
+            );
+        }
+        // Fault/resume invalidation permits a replacement interface to be discovered.
+        cache = None;
+        assert_eq!(
+            *super::cached_hardware(&mut cache, || Ok::<_, &str>(2)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn partial_commands_yield_to_maintenance_between_chunks() {
         struct Chunks {
             bytes: Vec<u8>,
@@ -1575,6 +1800,29 @@ mod tests {
             "FAN CURVE GET"
         );
         assert_eq!(ticks, 14);
+        let mut health_chunks = Chunks {
+            bytes: b"HELLO 2\nPING\nCAPS\n".to_vec(),
+            offset: 0,
+        };
+        let mut output = Vec::new();
+        let mut ticks = 0;
+        let command = super::serve_control_preamble(
+            &mut health_chunks,
+            &mut output,
+            &mut CommandDecoder::new(),
+            &mut ProtocolSession::new(),
+            || {
+                ticks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(command.as_deref(), Some("CAPS"));
+        assert!(output.ends_with(b"OK ready\n"));
+        assert!(
+            ticks > 2,
+            "fragmented health frames must continue cooling maintenance"
+        );
         assert!(!command_is_mutation(&["FAN", "CURVE", "GET"]));
         assert!(command_is_mutation(&[
             "FAN",
