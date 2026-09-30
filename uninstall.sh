@@ -100,6 +100,7 @@ asense_root true
 collect_dkms_versions
 
 # Disable the activation source first, then stop any already activated helper.
+asense_root systemctl disable asense.service 2>/dev/null || true
 asense_root systemctl disable asense.socket 2>/dev/null || true
 asense_stop_unit_if_loaded asense.socket
 asense_stop_unit_if_loaded asense.service

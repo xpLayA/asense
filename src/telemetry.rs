@@ -287,7 +287,7 @@ struct SampleBackoff {
 /// once, but it will not repeat the close/open cycle until real GPU activity
 /// rearms the lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NvidiaIdleLifecycle {
+pub(crate) struct NvidiaIdleLifecycle {
     idle_samples: u8,
     reopen_holdoff_samples: u8,
     release_armed: bool,
@@ -304,7 +304,7 @@ impl Default for NvidiaIdleLifecycle {
 }
 
 impl NvidiaIdleLifecycle {
-    fn discovery_allowed(&mut self) -> bool {
+    pub(crate) fn discovery_allowed(&mut self) -> bool {
         if self.reopen_holdoff_samples > 0 {
             self.reopen_holdoff_samples -= 1;
             return false;
@@ -312,7 +312,7 @@ impl NvidiaIdleLifecycle {
         true
     }
 
-    fn observe_live_sample(
+    pub(crate) fn observe_live_sample(
         &mut self,
         runtime_can_suspend: bool,
         _runtime_usage: Option<u32>,
@@ -348,7 +348,7 @@ impl NvidiaIdleLifecycle {
         true
     }
 
-    fn reset_for_runtime_transition(&mut self) {
+    pub(crate) fn reset_for_runtime_transition(&mut self) {
         *self = Self::default();
     }
 }
@@ -1719,7 +1719,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn find_labeled_temperature(
+pub(crate) fn find_labeled_temperature(
     root: &Path,
     expected_hwmon_name: &str,
     expected_label: &str,

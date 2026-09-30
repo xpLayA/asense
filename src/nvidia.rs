@@ -1183,7 +1183,7 @@ impl NvidiaController {
         }
     }
 
-    fn temperature(&self) -> Result<Option<u32>, NvidiaError> {
+    pub(crate) fn temperature(&self) -> Result<Option<u32>, NvidiaError> {
         let Some(function) = self.runtime.symbols.get_temperature else {
             return Ok(None);
         };

@@ -45,3 +45,6 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 TasksMax=32
 MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

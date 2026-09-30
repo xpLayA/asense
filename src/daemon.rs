@@ -15,6 +15,7 @@ use crate::control::{
     ProfileApplyReceipt, ProfilePowerReceipt, encode_control_capabilities,
     encode_profile_apply_receipt,
 };
+use crate::fan_curve::{CurveConfig, CurveRuntime, PAUSE_PATH, SETTINGS_PATH};
 use crate::hardware::{
     AcerHardware, FanBackend, FanMode as HardwareFanMode, FanSetting, PlatformProfile,
 };
@@ -71,11 +72,21 @@ impl CommandDecoder {
     /// Returns `Ok(None)` only on a clean EOF with no pending command.
     /// A partial frame at EOF is rejected because newline is the protocol's
     /// commit boundary; transport closure must never execute pending bytes.
+    #[cfg(test)]
     fn read(
         &mut self,
         reader: &mut impl BufRead,
     ) -> std::io::Result<Option<Result<String, String>>> {
+        self.read_with_maintenance(reader, || Ok(()))
+    }
+
+    fn read_with_maintenance(
+        &mut self,
+        reader: &mut impl BufRead,
+        mut maintenance: impl FnMut() -> Result<(), String>,
+    ) -> std::io::Result<Option<Result<String, String>>> {
         loop {
+            maintenance().map_err(std::io::Error::other)?;
             let available = reader.fill_buf()?;
             if available.is_empty() {
                 if self.pending.is_empty() {
@@ -134,8 +145,31 @@ pub fn run() -> Result<(), String> {
     ensure_root()?;
     let listener = activated_listener()?;
     let mut maintenance = RuntimeMaintenance::new();
+    let config = CurveConfig::load(Path::new(SETTINGS_PATH)).unwrap_or_else(|error| {
+        eprintln!("asense fan curve settings ignored: {error}");
+        CurveConfig::default()
+    });
+    let mut curve = CurveRuntime::new(config);
+    curve.limits = crate::fan_curve::EmergencyConfig::load(Path::new(
+        crate::fan_curve::EMERGENCY_SETTINGS_PATH,
+    ))
+    .unwrap_or_else(|error| {
+        eprintln!("asense emergency settings ignored: {error}");
+        crate::fan_curve::EmergencyConfig::default()
+    });
+    let mut sampler = crate::fan_curve::TemperatureSampler::default();
     loop {
         maintenance.poll_with_discovery();
+        if curve.status.config.enabled {
+            match AcerHardware::discover() {
+                Ok(hardware) => curve.tick(&hardware, &mut sampler),
+                Err(error) => {
+                    curve.hardware_unavailable(format!("hardware discovery failed: {error}"))
+                }
+            }
+        } else {
+            sampler.invalidate();
+        }
         let mut ready = libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -157,7 +191,7 @@ pub fn run() -> Result<(), String> {
         let (stream, _) = listener
             .accept()
             .map_err(|error| format!("accept failed: {error}"))?;
-        if let Err(error) = serve_client(stream, &mut maintenance) {
+        if let Err(error) = serve_client(stream, &mut maintenance, &mut curve, &mut sampler) {
             eprintln!("asense daemon client error: {error}");
         }
     }
@@ -262,6 +296,19 @@ pub fn probe() -> Result<(), String> {
 /// Here firmware regains fan ownership first, then the optional NVIDIA OEM
 /// offsets are reconciled with the profile that survived suspend. Custom
 /// offsets remain fail-closed because `set_profile` refuses to overwrite them.
+pub fn pause_before_sleep() -> Result<(), String> {
+    ensure_root()?;
+    let _guard = MutationGuard::acquire()?;
+    fs::write(PAUSE_PATH, b"paused\n").map_err(|e| e.to_string())?;
+    let hardware = AcerHardware::discover().map_err(|e| e.to_string())?;
+    if hardware.capabilities().fans.backend.is_some() {
+        hardware
+            .apply_fan_setting(FanSetting::Automatic)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn resume_after_sleep() -> Result<(), String> {
     ensure_root()?;
     let _guard = MutationGuard::acquire()?;
@@ -270,6 +317,11 @@ pub fn resume_after_sleep() -> Result<(), String> {
         hardware
             .apply_fan_setting(FanSetting::Automatic)
             .map_err(|error| format!("post-resume fan safety: {error}"))?;
+    }
+    match fs::remove_file(PAUSE_PATH) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot resume curve: {error}")),
     }
     if hardware.is_reference_model() {
         let pending = Path::new(NVIDIA_RESUME_PENDING);
@@ -479,17 +531,23 @@ fn activated_listener() -> Result<UnixListener, String> {
 fn serve_client(
     mut stream: UnixStream,
     maintenance: &mut RuntimeMaintenance,
+    curve: &mut CurveRuntime,
+    sampler: &mut crate::fan_curve::TemperatureSampler,
 ) -> Result<(), String> {
     authorize_peer(&stream)?;
     let mut hardware = AcerHardware::discover().map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| format!("set watchdog timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set response timeout: {error}"))?;
     let read_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(read_stream);
     let mut decoder = CommandDecoder::new();
     let mut protocol = ProtocolSession::new();
     let mut fan_session = FanSessionState::Automatic;
+    let mut watchdog = ManualWatchdog::default();
     let mut session_maintenance_active = false;
 
     let result = (|| -> Result<(), String> {
@@ -497,8 +555,29 @@ fn serve_client(
             if session_maintenance_active {
                 maintenance.poll_with(&hardware);
             }
-            enforce_thermal_watchdog(&mut hardware, &mut fan_session)?;
-            let command = match decoder.read(&mut reader) {
+            curve.tick(&hardware, sampler);
+            if !curve.status.config.enabled {
+                enforce_thermal_watchdog(
+                    &mut hardware,
+                    &mut fan_session,
+                    sampler,
+                    &mut watchdog,
+                    &curve.limits,
+                )?;
+            }
+            let command = match decoder.read_with_maintenance(&mut reader, || {
+                curve.tick(&hardware, sampler);
+                if !curve.status.config.enabled {
+                    enforce_thermal_watchdog(
+                        &mut hardware,
+                        &mut fan_session,
+                        sampler,
+                        &mut watchdog,
+                        &curve.limits,
+                    )?;
+                }
+                Ok(())
+            }) {
                 Ok(Some(command)) => command,
                 Ok(None) => break Ok(()),
                 Err(error)
@@ -537,7 +616,21 @@ fn serve_client(
                 maintenance.activate();
                 maintenance.poll_with(&hardware);
             }
-            let command_result = execute_command(&mut hardware, command, &mut fan_session);
+            let command_result = execute_curve_command(
+                &mut hardware,
+                command,
+                &mut fan_session,
+                curve,
+                sampler,
+                &mut watchdog,
+            );
+            if command_result.is_ok()
+                && command.starts_with("FAN ")
+                && !command.starts_with("FAN CURVE GET")
+                && !command.starts_with("FAN EMERGENCY")
+            {
+                watchdog = ManualWatchdog::default();
+            }
             let command_succeeded = command_result.is_ok();
             write_response(&mut stream, command_result)?;
             if command_succeeded {
@@ -546,7 +639,7 @@ fn serve_client(
         }
     })();
 
-    let cleanup = if fan_session.requires_auto_on_disconnect() {
+    let cleanup = if fan_session.requires_auto_on_disconnect() && !curve.status.config.enabled {
         match MutationGuard::acquire() {
             Ok(_mutation_guard) => hardware
                 .apply_fan_setting(FanSetting::Automatic)
@@ -559,6 +652,9 @@ fn serve_client(
     } else {
         Ok(())
     };
+    if !curve.status.config.enabled {
+        sampler.invalidate();
+    }
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -609,7 +705,10 @@ impl FanSessionState {
     }
 
     fn needs_thermal_watchdog(self) -> bool {
-        matches!(self, Self::PendingMutation | Self::Manual)
+        matches!(
+            self,
+            Self::PendingMutation | Self::Manual | Self::EmergencyMaximum
+        )
     }
 
     fn requires_auto_on_disconnect(self) -> bool {
@@ -666,6 +765,81 @@ fn authorize_peer(stream: &UnixStream) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn execute_curve_command(
+    hardware: &mut AcerHardware,
+    command: &str,
+    session: &mut FanSessionState,
+    curve: &mut CurveRuntime,
+    sampler: &mut crate::fan_curve::TemperatureSampler,
+    watchdog: &mut ManualWatchdog,
+) -> Result<String, String> {
+    let fields: Vec<&str> = command.split_ascii_whitespace().collect();
+    match fields.as_slice() {
+        ["FAN", "EMERGENCY", "GET"] => {
+            let status = if !curve.status.config.enabled && session.needs_thermal_watchdog() {
+                watchdog.status(curve.limits.clone())
+            } else {
+                curve.emergency_status()
+            };
+            return serde_json::to_string(&status).map_err(|e| e.to_string());
+        }
+        ["FAN", "EMERGENCY", "SET", cpu, gpu] => {
+            let config = crate::fan_curve::EmergencyConfig {
+                schema: 1,
+                cpu_limit: cpu.parse().map_err(|_| "invalid CPU emergency limit")?,
+                gpu_limit: gpu.parse().map_err(|_| "invalid GPU emergency limit")?,
+            };
+            config.validate()?;
+            let _guard = MutationGuard::acquire()?;
+            config.save(Path::new(crate::fan_curve::EMERGENCY_SETTINGS_PATH))?;
+            curve.set_limits(config);
+            watchdog.thermal_safe_samples = 0;
+            watchdog.next_tick = None;
+            return Ok("emergency=settings-saved".into());
+        }
+        ["FAN", "CURVE", "GET"] => {
+            return serde_json::to_string(&curve.status).map_err(|e| e.to_string());
+        }
+        ["FAN", "CURVE", "SET", cpu, gpu] => {
+            let config = CurveConfig::from_tokens(cpu, gpu)?;
+            let _guard = MutationGuard::acquire()?;
+            if Path::new(PAUSE_PATH).exists() {
+                return Err("fan curve is paused for suspend".into());
+            }
+            curve.activate(config, hardware, Path::new(SETTINGS_PATH), sampler)?;
+            session.automatic_readback_confirmed(); // Ownership belongs to the global curve.
+            return Ok("fan=curve".into());
+        }
+        ["FAN", "MANUAL", cpu, gpu] => {
+            parse_manual_percent(cpu)?;
+            parse_manual_percent(gpu)?;
+            let reading = sampler.read(hardware);
+            if let Some(error) = reading.thermal_fault(&curve.limits) {
+                return Err(error);
+            }
+            reading.complete()?;
+        }
+        _ => {}
+    }
+    if matches!(
+        fields.as_slice(),
+        ["FAN", "AUTO"] | ["FAN", "MAXIMUM"] | ["FAN", "MANUAL", _, _]
+    ) {
+        let _guard = MutationGuard::acquire()?;
+        curve.disable(Path::new(SETTINGS_PATH))?;
+    }
+    let profile_change = matches!(fields.as_slice(), ["PROFILE", _]);
+    let result = execute_command(hardware, command, session);
+    if result.is_ok() && matches!(fields.as_slice(), ["FAN", "AUTO"] | ["FAN", "MAXIMUM"]) {
+        sampler.invalidate();
+    }
+    if profile_change && curve.status.config.enabled {
+        curve.reset();
+        curve.tick(hardware, sampler);
+    }
+    result
 }
 
 fn execute_command(
@@ -1039,6 +1213,7 @@ fn protocol_handshake(fields: &[&str]) -> Option<Result<String, String>> {
 
 fn command_is_mutation(fields: &[&str]) -> bool {
     match fields {
+        ["FAN", "CURVE" | "EMERGENCY", "GET"] => false,
         ["FAN", ..] | ["PROFILE", ..] => true,
         ["RGB", operation, ..] | ["PLATFORM", operation, ..] => *operation != "GET",
         ["LIGHTING", "APPLY" | "POWER", ..] => true,
@@ -1128,31 +1303,162 @@ fn parse_manual_percent(value: &str) -> Result<u8, String> {
     Ok(value)
 }
 
+#[derive(Default)]
+struct ManualWatchdog {
+    next_tick: Option<Instant>,
+    fault_since: Option<Instant>,
+    original: Option<[u8; 2]>,
+    safe_samples: u8,
+    thermal_safe_samples: u8,
+    emergency: bool,
+    reason: Option<String>,
+    last_reading: Option<crate::fan_curve::TemperatureReading>,
+    last_processed_sample: Option<Instant>,
+}
+impl ManualWatchdog {
+    fn status(
+        &self,
+        config: crate::fan_curve::EmergencyConfig,
+    ) -> crate::fan_curve::EmergencyStatus {
+        crate::fan_curve::EmergencyStatus::snapshot(
+            config,
+            if self.emergency {
+                "emergency"
+            } else if self.fault_since.is_some() {
+                "sensor-fault"
+            } else {
+                "monitoring"
+            }
+            .into(),
+            self.last_reading.as_ref(),
+            self.reason.clone(),
+            self.thermal_safe_samples,
+        )
+    }
+    fn observe_thermal(
+        &mut self,
+        reading: &crate::fan_curve::TemperatureReading,
+        limits: &crate::fan_curve::EmergencyConfig,
+    ) -> bool {
+        if let Some(reason) = reading.thermal_fault(limits) {
+            if !self.emergency {
+                eprintln!("asense Manual emergency: {reason}");
+            }
+            self.reason = Some(reason);
+            self.emergency = true;
+            self.thermal_safe_samples = 0;
+        } else if self.emergency {
+            if limits.safe(reading) {
+                self.thermal_safe_samples += 1;
+            } else {
+                self.thermal_safe_samples = 0;
+            }
+        }
+        self.emergency && self.thermal_safe_samples < 5
+    }
+
+    fn targets(&mut self, valid: bool, now: Instant) -> Option<[u8; 2]> {
+        if !valid {
+            self.fault_since.get_or_insert(now);
+            self.safe_samples = 0;
+        } else if self.fault_since.is_some() {
+            self.safe_samples += 1;
+            if self.safe_samples >= 5 {
+                let original = self.original.take();
+                self.fault_since = None;
+                self.safe_samples = 0;
+                return original;
+            }
+        }
+        if self
+            .fault_since
+            .is_some_and(|since| now.duration_since(since) >= Duration::from_secs(3))
+        {
+            return self.original.map(|p| [p[0].max(80), p[1].max(80)]);
+        }
+        None
+    }
+}
 fn enforce_thermal_watchdog(
     hardware: &mut AcerHardware,
     fan_session: &mut FanSessionState,
+    sampler: &mut crate::fan_curve::TemperatureSampler,
+    watchdog: &mut ManualWatchdog,
+    limits: &crate::fan_curve::EmergencyConfig,
 ) -> Result<(), String> {
     if !fan_session.needs_thermal_watchdog() {
+        *watchdog = ManualWatchdog::default();
         return Ok(());
     }
-    let cpu = hardware.read_acer_temp_millidegrees(1);
-    let gpu = hardware.read_acer_temp_millidegrees(2);
-    let unsafe_or_unavailable = cpu.is_err()
-        || gpu.is_err()
-        || cpu.is_ok_and(|value| value >= 92_000)
-        || gpu.is_ok_and(|value| value >= 84_000);
-    if !unsafe_or_unavailable {
+    let now = Instant::now();
+    if watchdog.next_tick.is_some_and(|next| now < next) {
         return Ok(());
+    }
+    watchdog.next_tick = Some(now + Duration::from_secs(1));
+    let reading = sampler.read(hardware);
+    if reading.sampled_at.is_some() && reading.sampled_at == watchdog.last_processed_sample {
+        return Ok(());
+    }
+    watchdog.last_processed_sample = reading.sampled_at;
+    watchdog.last_reading = Some(reading.clone());
+    if watchdog.observe_thermal(&reading, limits) {
+        if watchdog.original.is_none() {
+            watchdog.original = hardware.read_fan_state().ok().map(|s| {
+                [
+                    crate::hardware::pwm_to_percent(s.cpu.pwm_raw),
+                    crate::hardware::pwm_to_percent(s.gpu.pwm_raw),
+                ]
+            });
+        }
+        *fan_session = FanSessionState::EmergencyMaximum;
+        let _guard = MutationGuard::acquire()?;
+        return hardware
+            .apply_maximum_failsafe()
+            .map_err(|e| format!("thermal failsafe failed: {e}"));
+    }
+    if watchdog.emergency {
+        let _guard = MutationGuard::acquire()?;
+        if let Some(targets) = watchdog.original {
+            hardware
+                .apply_fan_setting(FanSetting::Manual {
+                    cpu_percent: targets[0],
+                    gpu_percent: targets[1],
+                })
+                .map_err(|e| format!("Manual emergency recovery failed: {e}"))?;
+            *fan_session = FanSessionState::Manual;
+        } else {
+            hardware
+                .apply_fan_setting(FanSetting::Automatic)
+                .map_err(|e| format!("emergency Auto recovery failed: {e}"))?;
+            *fan_session = FanSessionState::Automatic;
+        }
+        watchdog.emergency = false;
+        watchdog.reason = None;
+        watchdog.thermal_safe_samples = 0;
+        watchdog.original = None;
+        watchdog.fault_since = None;
+    }
+    let complete = reading.complete();
+    if let Err(error) = &complete
+        && watchdog.original.is_none()
+    {
+        let state = hardware
+            .read_fan_state()
+            .map_err(|e| format!("Manual control readback failed: {e}"))?;
+        watchdog.original = Some([
+            crate::hardware::pwm_to_percent(state.cpu.pwm_raw),
+            crate::hardware::pwm_to_percent(state.gpu.pwm_raw),
+        ]);
+        eprintln!("asense Manual sensor fault: {error}");
+    }
+    if let Some(targets) = watchdog.targets(complete.is_ok(), now) {
+        let _guard = MutationGuard::acquire()?;
+        hardware
+            .update_manual_fan_speeds(targets[0], targets[1])
+            .map_err(|e| format!("Manual sensor fallback/recovery control failed: {e}"))?;
     }
 
-    // Set the fail-safe state before writing so disconnect cleanup still
-    // retries Auto if the emergency Maximum transition itself fails.
-    *fan_session = FanSessionState::EmergencyMaximum;
-    let _mutation_guard = MutationGuard::acquire()?;
-    hardware
-        .apply_fan_setting(FanSetting::Maximum)
-        .map(|_| ())
-        .map_err(|error| format!("thermal failsafe failed: {error}"))
+    Ok(())
 }
 
 fn write_response(stream: &mut UnixStream, result: Result<String, String>) -> Result<(), String> {
@@ -1202,7 +1508,7 @@ fn ensure_root() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandDecoder, FanSessionState, ProtocolAction, ProtocolSession,
+        CommandDecoder, FanSessionState, ManualWatchdog, ProtocolAction, ProtocolSession,
         command_activates_runtime_maintenance, command_is_mutation,
         finish_pending_nvidia_reconciliation, load_cached_lighting, parse_color,
         parse_lighting_mode, parse_manual_percent, parse_on_off, parse_zone_colors,
@@ -1220,6 +1526,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Cursor};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
 
     fn cached_request(target: LightingTarget, color: [u8; 3]) -> LightingRequest {
         LightingRequest {
@@ -1230,6 +1537,52 @@ mod tests {
             color,
             zone_colors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn partial_commands_yield_to_maintenance_between_chunks() {
+        struct Chunks {
+            bytes: Vec<u8>,
+            offset: usize,
+        }
+        impl std::io::Read for Chunks {
+            fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl BufRead for Chunks {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Ok(&self.bytes[self.offset..self.bytes.len().min(self.offset + 1)])
+            }
+            fn consume(&mut self, amount: usize) {
+                self.offset += amount;
+            }
+        }
+        let mut chunks = Chunks {
+            bytes: b"FAN CURVE GET\n".to_vec(),
+            offset: 0,
+        };
+        let mut ticks = 0;
+        assert_eq!(
+            CommandDecoder::new()
+                .read_with_maintenance(&mut chunks, || {
+                    ticks += 1;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "FAN CURVE GET"
+        );
+        assert_eq!(ticks, 14);
+        assert!(!command_is_mutation(&["FAN", "CURVE", "GET"]));
+        assert!(command_is_mutation(&[
+            "FAN",
+            "CURVE",
+            "SET",
+            "45:30,85:100",
+            "40:30,78:100"
+        ]));
     }
 
     #[test]
@@ -1310,6 +1663,65 @@ mod tests {
     }
 
     #[test]
+    fn manual_sensor_loss_holds_then_falls_back_and_restores_after_five_samples() {
+        let now = Instant::now();
+        let mut watchdog = ManualWatchdog {
+            original: Some([50, 90]),
+            ..Default::default()
+        };
+        for second in 0..3 {
+            assert_eq!(
+                watchdog.targets(false, now + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert_eq!(
+            watchdog.targets(false, now + Duration::from_secs(3)),
+            Some([80, 90])
+        );
+        for second in 4..8 {
+            assert_eq!(
+                watchdog.targets(true, now + Duration::from_secs(second)),
+                Some([80, 90])
+            );
+        }
+        assert_eq!(
+            watchdog.targets(true, now + Duration::from_secs(8)),
+            Some([50, 90])
+        );
+        assert_eq!(watchdog.fault_since, None);
+    }
+
+    #[test]
+    fn manual_emergency_uses_configured_limits_and_five_safe_samples() {
+        let limits = crate::fan_curve::EmergencyConfig {
+            schema: 1,
+            cpu_limit: 100,
+            gpu_limit: 90,
+        };
+        let mut watchdog = ManualWatchdog::default();
+        let read = |cpu, gpu| crate::fan_curve::TemperatureReading::from(Ok((cpu, Some(gpu))));
+        assert!(!watchdog.observe_thermal(&read(99.0, 89.0), &limits));
+        assert!(watchdog.observe_thermal(&read(100.0, 60.0), &limits));
+        assert!(watchdog.reason.as_ref().unwrap().contains("100°C"));
+        assert!(watchdog.observe_thermal(&read(95.0, 60.0), &limits));
+        assert_eq!(watchdog.thermal_safe_samples, 0);
+        for _ in 0..4 {
+            assert!(watchdog.observe_thermal(&read(94.0, 84.0), &limits));
+        }
+        assert!(!watchdog.observe_thermal(&read(94.0, 84.0), &limits));
+        assert_eq!(watchdog.thermal_safe_samples, 5);
+        assert!(!super::command_is_mutation(&["FAN", "EMERGENCY", "GET"]));
+        assert!(super::command_is_mutation(&[
+            "FAN",
+            "EMERGENCY",
+            "SET",
+            "100",
+            "90"
+        ]));
+    }
+
+    #[test]
     fn percent_is_fail_closed() {
         assert_eq!(parse_manual_percent("20").unwrap(), 20);
         assert_eq!(parse_manual_percent("100").unwrap(), 100);
@@ -1375,7 +1787,7 @@ mod tests {
 
         session = FanSessionState::EmergencyMaximum;
         assert!(session.requires_auto_on_disconnect());
-        assert!(!session.needs_thermal_watchdog());
+        assert!(session.needs_thermal_watchdog());
     }
 
     #[test]

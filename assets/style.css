@@ -2290,3 +2290,32 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: rgba(66, 220, 246, 0.34);
   color: var(--text);
 }
+
+/* Curve editing overlays the fixed dashboard without expanding its cards. */
+.curve-overlay { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgba(0,0,0,.75); padding: 16px; }
+.curve-dialog { width: min(590px, 100%); max-height: 95%; overflow-y: auto; background: var(--panel-solid); border: 1px solid var(--stroke-strong); border-radius: 16px; padding: 20px; color: var(--text); }
+.curve-dialog h2, .curve-dialog h3 { margin: 0 0 10px; }
+.curve-dialog p { font-size: 12px; line-height: 1.5; color: var(--text-2); }
+.curve-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.curve-point { display: grid; grid-template-columns: 1fr 1fr 60px; gap: 5px; margin: 7px 0; }
+.curve-point input { width: 100%; background: var(--bg-0); border: 1px solid var(--stroke-strong); border-radius: 5px; color: var(--text); padding: 6px; }
+.curve-heading { font-size: 12px; color: var(--muted); }
+.curve-dialog button { padding: 6px 8px; border: 1px solid var(--stroke-strong); border-radius: 6px; color: var(--text); background: var(--tile-strong); cursor: pointer; font-size: 12px; }
+.curve-dialog button:disabled { opacity: .4; cursor: default; }
+.curve-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.curve-status { font-size: 12px; color: var(--text-2); margin: 8px 0; }
+.curve-status span { display: block; margin-top: 4px; }
+.curve-error { color: var(--red) !important; }
+
+.mode-switch .mode { white-space: normal; line-height: 1.1; padding: 2px; }
+.fan-mode-summary.curve-status { flex-direction: column; gap: 2px; margin: 0; cursor: pointer; }
+.fan-mode-summary.curve-status span { margin: 0; }
+
+.emergency-panel { display: flex; flex-direction: column; gap: 8px; padding: 8px; font-size: 12px; overflow: auto; max-height: 100%; }
+.emergency-readout { display: flex; flex-direction: column; gap: 4px; }
+.emergency-panel small { color: var(--muted); }
+.emergency-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.emergency-inputs label { display: flex; flex-direction: column; gap: 4px; }
+.emergency-inputs input { width: 100%; padding: 6px; color: var(--text); background: var(--bg-0); border: 1px solid var(--stroke-strong); border-radius: 5px; }
+.emergency-panel button { padding: 6px 8px; color: var(--text); background: var(--tile-strong); border: 1px solid var(--stroke-strong); border-radius: 6px; cursor: pointer; }
+.emergency-panel button:disabled { opacity: .4; cursor: default; }

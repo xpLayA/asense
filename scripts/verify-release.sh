@@ -119,21 +119,22 @@ printf '%s\n' \
   'printf "%s\\n" "$*" >>"$ASENSE_SLEEP_TEST_LOG"' \
   >"$temporary/sleep-bin/systemctl"
 printf '%s\n' '#!/bin/sh' 'exit 0' >"$temporary/sleep-bin/logger"
+printf '%s\n' '#!/bin/sh' 'printf "helper %s\\n" "$*" >>"$ASENSE_SLEEP_TEST_LOG"' >"$temporary/sleep-bin/asensed"
+chmod 0755 "$temporary/sleep-bin/asensed"
 chmod 0755 "$temporary/sleep-bin/systemctl" "$temporary/sleep-bin/logger"
 : >"$temporary/sleep-actions"
 ASENSE_SLEEP_TEST_LOG="$temporary/sleep-actions" \
+  ASENSE_SLEEP_HELPER="$temporary/sleep-bin/asensed" \
   PATH="$temporary/sleep-bin:$PATH" \
   sh packaging/asense-system-sleep post suspend
 grep --fixed-strings --line-regexp 'reload asense.service' \
   "$temporary/sleep-actions"
 : >"$temporary/sleep-actions"
 ASENSE_SLEEP_TEST_LOG="$temporary/sleep-actions" \
+  ASENSE_SLEEP_HELPER="$temporary/sleep-bin/asensed" \
   PATH="$temporary/sleep-bin:$PATH" \
   sh packaging/asense-system-sleep pre suspend
-[[ ! -s "$temporary/sleep-actions" ]] || {
-  printf 'asense-verify: sleep hook reconciled during the pre phase\n' >&2
-  exit 1
-}
+grep --fixed-strings --line-regexp 'helper --suspend' "$temporary/sleep-actions"
 
 printf '\n==> package-to-standalone ownership guard\n'
 install -d "$temporary/dpkg-bin"

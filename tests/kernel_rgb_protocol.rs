@@ -194,6 +194,11 @@ fn gaming_fan_surface_is_typed_bounded_and_hwmon_compatible() {
     assert!(read_speed.contains("if (value > 100) return -EPROTO"));
 
     let mode_store = body("asense_fan_mode_store", "asense_fan_speed_show");
+    assert!(
+        mode_store
+            .contains("if (!error && previous == mode && mode != ASENSE_FAN_MODE_AUTO) goto out;")
+    );
+    assert!(!mode_store.contains("if (!error && previous == mode) goto out;"));
     assert!(mode_store.contains("asense_write_fan_mode(rgb, fan_bitmap, mode)"));
     assert!(mode_store.contains("asense_read_fan_mode(rgb, fan_bitmap, &actual)"));
     assert!(mode_store.contains("asense_write_fan_mode(rgb, fan_bitmap, previous)"));
@@ -594,4 +599,114 @@ fn system_resume_replays_only_cached_rgb_with_readback() {
         "DEFINE_SIMPLE_DEV_PM_OPS(asense_rgb_pm_ops,\n\t\t\t\tasense_rgb_suspend, asense_rgb_resume)"
     ));
     assert!(DRIVER.contains(".pm = pm_sleep_ptr(&asense_rgb_pm_ops),"));
+}
+
+#[test]
+fn firmware_hwmon_reads_real_units_and_rejects_failed_or_unsupported_sensors() {
+    // Run the driver's actual read/visibility callbacks with a deterministic
+    // firmware transport. This verifies units and failures without WMI writes.
+    let start = DRIVER
+        .find("static const u8 asense_temp_sensor_ids[]")
+        .unwrap();
+    let end = DRIVER
+        .find("static const struct hwmon_ops asense_hwmon_ops")
+        .unwrap();
+    let callbacks = &DRIVER[start..end];
+    let prelude = r#"
+#include <stdint.h>
+#include <assert.h>
+#include <errno.h>
+#include <string.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef unsigned int umode_t;
+#define BIT(n) (1ULL << (n))
+#define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
+#define FIELD_GET(mask,value) (((value) & (mask)) >> __builtin_ctzll(mask))
+#define ASENSE_GAMING_SYS_INFO_GET 5
+#define ASENSE_SENSOR_STATUS_MASK GENMASK_ULL(7,0)
+#define ASENSE_SENSOR_VALUE_MASK GENMASK_ULL(23,8)
+enum hwmon_sensor_types { hwmon_temp, hwmon_fan, hwmon_pwm };
+enum { hwmon_temp_input, hwmon_temp_label, hwmon_fan_input, hwmon_fan_label };
+struct asense_rgb { u16 supported_sensors; int lock; };
+struct device { struct asense_rgb *data; };
+static u64 reply, last_command;
+static int transport_error;
+static void *dev_get_drvdata(struct device *dev) { return dev->data; }
+static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
+static void mutex_unlock(int *lock) { assert(*lock); *lock=0; }
+static int asense_scalar_call(struct asense_rgb *rgb, unsigned method, u64 command, u64 *out) {
+    assert(rgb->lock && method == 5); last_command=command; *out=reply; return transport_error;
+}
+"#;
+    let cases = r#"
+int main(void) {
+    struct asense_rgb rgb={0}; struct device dev={&rgb}; long value=-1; const char *label;
+    assert(asense_hwmon_visible(&rgb,hwmon_fan,hwmon_fan_input,0)==0);
+    assert(asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value)==-EOPNOTSUPP);
+    rgb.supported_sensors=BIT(0)|BIT(1)|BIT(5)|BIT(9);
+    assert(asense_hwmon_visible(&rgb,hwmon_fan,hwmon_fan_input,0)==0444);
+    assert(asense_hwmon_visible(&rgb,hwmon_pwm,0,0)==0);
+    reply=3100ULL<<8;
+    assert(!asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value));
+    assert(value==3100 && last_command==0x201);
+    reply=5400ULL<<8;
+    assert(!asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value)); assert(value==5400);
+    reply=2600ULL<<8;
+    assert(!asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,1,&value));
+    assert(value==2600 && last_command==0x601);
+    reply=72ULL<<8;
+    assert(!asense_hwmon_read(&dev,hwmon_temp,hwmon_temp_input,0,&value));
+    assert(value==72000 && last_command==0x101);
+    reply=61ULL<<8;
+    assert(!asense_hwmon_read(&dev,hwmon_temp,hwmon_temp_input,1,&value));
+    assert(value==61000 && last_command==0xa01);
+    reply=1;
+    assert(asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value)==-EIO);
+    reply=121ULL<<8;
+    assert(asense_hwmon_read(&dev,hwmon_temp,hwmon_temp_input,0,&value)==-ERANGE);
+    transport_error=-EPROTO;
+    assert(asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value)==-EPROTO);
+    transport_error=0; reply=0;
+    assert(!asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,0,&value)); assert(value==0);
+    assert(asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,2,&value)==-EOPNOTSUPP);
+    assert(asense_hwmon_read(&dev,hwmon_fan,hwmon_fan_input,-1,&value)==-EOPNOTSUPP);
+    assert(!asense_hwmon_read_string(&dev,hwmon_fan,hwmon_fan_label,1,&label));
+    assert(!strcmp(label,"GPU"));
+    return 0;
+}
+"#;
+    let directory =
+        std::env::temp_dir().join(format!("asense-hwmon-c-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("hwmon.c");
+    let binary = directory.join("hwmon-test");
+    std::fs::write(&source, format!("{prelude}\n{callbacks}\n{cases}")).unwrap();
+    let build = std::process::Command::new("cc")
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-parameter",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let result = std::process::Command::new(&binary).output().unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

@@ -199,6 +199,66 @@ impl ControlClient {
         self.request("FAN AUTO").map(|_| ())
     }
 
+    pub fn emergency(&mut self) -> ControlResult<crate::fan_curve::EmergencyStatus> {
+        let response = self.request("FAN EMERGENCY GET")?;
+        let status: crate::fan_curve::EmergencyStatus = serde_json::from_str(&response)
+            .map_err(|e| ControlError::Protocol(format!("invalid emergency status: {e}")))?;
+        status.config.validate().map_err(ControlError::Protocol)?;
+        if status.state.len() > 32
+            || status.reason.as_ref().is_some_and(|r| r.len() > 2048)
+            || status.safe_samples > 5
+            || [status.cpu_temperature, status.gpu_temperature]
+                .into_iter()
+                .flatten()
+                .any(|t| !t.is_finite() || !(0.0..=120.0).contains(&t))
+        {
+            return Err(ControlError::Protocol(
+                "invalid emergency status fields".into(),
+            ));
+        }
+        Ok(status)
+    }
+    pub fn set_emergency(
+        &mut self,
+        config: &crate::fan_curve::EmergencyConfig,
+    ) -> ControlResult<crate::fan_curve::EmergencyStatus> {
+        config.validate().map_err(ControlError::InvalidRequest)?;
+        self.request(&format!(
+            "FAN EMERGENCY SET {} {}",
+            config.cpu_limit, config.gpu_limit
+        ))?;
+        self.emergency()
+    }
+
+    pub fn fan_curve(&mut self) -> ControlResult<crate::fan_curve::CurveStatus> {
+        let response = self.request("FAN CURVE GET")?;
+        let status: crate::fan_curve::CurveStatus = serde_json::from_str(&response)
+            .map_err(|e| ControlError::Protocol(format!("invalid curve status: {e}")))?;
+        status.config.validate().map_err(ControlError::Protocol)?;
+        if status.state.len() > 32
+            || status.fault.as_ref().is_some_and(|f| f.len() > 2048)
+            || status
+                .requested
+                .is_some_and(|p| p.iter().any(|v| !(20..=100).contains(v)))
+        {
+            return Err(ControlError::Protocol("invalid curve status fields".into()));
+        }
+        Ok(status)
+    }
+
+    pub fn set_fan_curve(
+        &mut self,
+        config: &crate::fan_curve::CurveConfig,
+    ) -> ControlResult<crate::fan_curve::CurveStatus> {
+        config.validate().map_err(ControlError::InvalidRequest)?;
+        self.request(&format!(
+            "FAN CURVE SET {} {}",
+            crate::fan_curve::CurveConfig::token(&config.cpu),
+            crate::fan_curve::CurveConfig::token(&config.gpu)
+        ))?;
+        self.fan_curve()
+    }
+
     pub fn ping(&mut self) -> ControlResult<()> {
         self.request("PING").map(|_| ())
     }
@@ -810,6 +870,165 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn emergency_apply_uses_bounded_commands_and_verified_status() {
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            handshake: None,
+        };
+        let config = crate::fan_curve::EmergencyConfig {
+            schema: 1,
+            cpu_limit: 100,
+            gpu_limit: 90,
+        };
+        let expected = crate::fan_curve::EmergencyStatus {
+            config: config.clone(),
+            state: "monitoring".into(),
+            cpu_temperature: Some(70.0),
+            gpu_temperature: Some(55.0),
+            gpu_sleeping: false,
+            sample_age_seconds: Some(0),
+            reason: None,
+            safe_samples: 0,
+        };
+        let reply = format!("OK {}\n", serde_json::to_string(&expected).unwrap());
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN EMERGENCY SET 100 90\n");
+            assert!(command.len() <= super::MAX_CONTROL_COMMAND_BYTES);
+            server_stream
+                .write_all(b"OK emergency=settings-saved\n")
+                .unwrap();
+            command.clear();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN EMERGENCY GET\n");
+            server_stream.write_all(reply.as_bytes()).unwrap();
+        });
+        assert_eq!(client.set_emergency(&config).unwrap(), expected);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn emergency_probe_rejection_keeps_old_daemon_session_usable() {
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            handshake: None,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN EMERGENCY GET\n");
+            server_stream.write_all(b"ERR unknown command\n").unwrap();
+            command.clear();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "PING\n");
+            server_stream.write_all(b"OK ready\n").unwrap();
+        });
+        assert!(matches!(
+            client.emergency(),
+            Err(ControlError::CommandRejected(_))
+        ));
+        client.ping().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_emergency_status_is_rejected() {
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            handshake: None,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            let status = crate::fan_curve::EmergencyStatus {
+                config: Default::default(),
+                state: "monitoring".into(),
+                cpu_temperature: Some(121.0),
+                gpu_temperature: None,
+                gpu_sleeping: false,
+                sample_age_seconds: Some(0),
+                reason: None,
+                safe_samples: 6,
+            };
+            server_stream
+                .write_all(format!("OK {}\n", serde_json::to_string(&status).unwrap()).as_bytes())
+                .unwrap();
+        });
+        assert!(matches!(client.emergency(), Err(ControlError::Protocol(_))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn curve_probe_rejection_keeps_old_daemon_session_usable() {
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            handshake: None,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN CURVE GET\n");
+            server_stream.write_all(b"ERR unknown command\n").unwrap();
+            command.clear();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "PING\n");
+            server_stream.write_all(b"OK ready\n").unwrap();
+        });
+        assert!(matches!(
+            client.fan_curve(),
+            Err(ControlError::CommandRejected(_))
+        ));
+        client.ping().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn curve_apply_uses_bounded_tokens_and_reads_daemon_owned_status() {
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            handshake: None,
+        };
+        let config =
+            crate::fan_curve::CurveConfig::from_tokens("45:30,85:100", "40:30,78:100").unwrap();
+        let status = crate::fan_curve::CurveStatus {
+            config: config.clone(),
+            state: "running".into(),
+            requested: Some([60, 50]),
+            fault: None,
+        };
+        let response = format!("OK {}\n", serde_json::to_string(&status).unwrap());
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN CURVE SET 45:30,85:100 40:30,78:100\n");
+            assert!(command.len() - 1 <= super::MAX_CONTROL_COMMAND_BYTES);
+            server_stream.write_all(b"OK fan=curve\n").unwrap();
+            command.clear();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "FAN CURVE GET\n");
+            server_stream.write_all(response.as_bytes()).unwrap();
+        });
+        assert_eq!(client.set_fan_curve(&config).unwrap(), status);
+        server.join().unwrap();
+    }
 
     #[test]
     fn response_status_tokens_are_exact_and_errors_are_classified() {

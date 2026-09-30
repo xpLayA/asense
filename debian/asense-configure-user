@@ -140,6 +140,7 @@ if [ -d /run/systemd/system ]; then
     systemctl stop asense.service asense.socket >/dev/null 2>&1 || true
     systemctl daemon-reload
     systemctl enable --now asense.socket
+    systemctl enable --now asense.service
 fi
 
 if [ "$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)" = \

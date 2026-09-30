@@ -7,6 +7,7 @@
 
 pub mod control;
 pub mod daemon;
+pub mod fan_curve;
 pub mod hardware;
 pub mod lighting;
 pub mod mutation_lock;

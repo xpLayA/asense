@@ -45,6 +45,7 @@ pre_remove() {
     /usr/lib/asense/asense-shortcut remove \
       "$(sed -n '1p' /etc/asense/desktop-user)" >/dev/null 2>&1 || true
   fi
+  systemctl disable --now asense.service >/dev/null 2>&1 || true
   systemctl disable --now asense.socket >/dev/null 2>&1 || true
   systemctl stop asense.service >/dev/null 2>&1 || true
   if [[ -x /usr/lib/asense/asensed ]]; then

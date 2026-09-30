@@ -290,10 +290,64 @@ install, pin, downgrade or override it. Then run:
 
 ```bash
 cargo test --locked
-cargo build --release --locked --bin asensed --no-default-features
-cargo build --release --locked --bin asense --features gui
-./install.sh
+./build.sh
+./install.sh ./target/release/asense
 ```
+
+`build.sh` builds the release GUI and daemon using the installed Rust toolchain
+and can be run from any directory. It does not install dependencies or ASense.
+The separate installer rebuilds and activates the optional kernel driver.
+
+## Automatic fan curves
+
+Select **Auto Curve** to edit separate CPU and GPU temperature/speed points,
+then choose **Apply and enable**. The daemon follows the curves once per second,
+continues after the window closes, and restores enabled curves after reboot.
+Installation enables the daemon at boot after configuring its private socket.
+**Firmware Auto** returns control to Acer. Selecting Firmware Auto, Manual, or
+Maximum disables the saved curve mode without deleting its points.
+
+The defaults ramp CPU speed from 30% at 45°C through 60% at 65°C to 100% at
+85°C; GPU speed reaches 60% at 60°C and 100% at 78°C. Speed increases are
+immediate; decreases wait five seconds and then fall by at most 5% per second.
+Curves require 2–8 increasing temperature points, nondecreasing percentages
+within 20–100%, and a final 100% point by 85°C CPU / 78°C GPU.
+
+The daemon reads fresh CPU package and GPU temperatures. A positively identified
+sleeping NVIDIA GPU uses its curve minimum without being woken for telemetry.
+By default, CPU ≥92°C or GPU ≥84°C triggers thermal Emergency and Maximum.
+The Emergency tab saves separate CPU (60–100°C) and GPU (60–90°C) limits;
+Auto Curve and Manual protection both use them. Recovery requires five fresh
+complete safe samples below each saved limit minus 5°C. Manual recovery restores
+its verified settings; Firmware Auto keeps firmware ownership. Emergency settings
+are stored independently in `/var/lib/asense/fan-emergency.json`.
+A sensor fault holds the last verified speeds for up to three seconds, then
+applies at least 80% to both fans (higher valid curve demand still wins). It
+recovers after five fresh complete valid samples. Fan write failures are shown
+as control faults, and requested percentages update only after hardware readback.
+The daemon shares one retained NVML session across curve and Manual sampling,
+with initialization retries capped at 30 seconds. When NVML is required, the
+session stays open until software control ends or the GPU sleeps; this may keep
+the GPU awake. Optional ASense hwmon channels provide measured RPM and firmware
+temperatures when supported. Missing RPM displays as unavailable, never as an
+estimate derived from fan percentage. The fan panel
+shows background state, requested percentages, faults, and existing RPM gauges.
+Settings are stored privately in `/var/lib/asense/fan-curve.json`. Upgrades start
+with curves disabled unless valid enabled settings already exist. Older daemons
+keep their existing controls and do not expose the curve editor.
+
+Rebuild with `./build.sh`, install with `./install.sh ./target/release/asense`,
+then check temperature, requested speed, and RPM during load and cooldown.
+Confirm the curve continues after closing ASense and is restored after reboot.
+After installing this update, monitor descriptor counts for one hour while
+alternating GPU activity and idle:
+
+```bash
+sudo python3 scripts/monitor-daemon-fds.py > asense-fds.csv
+```
+
+The CSV includes total and NVIDIA descriptors. Restarting the daemon begins a
+new measurement; the monitor stops rather than mixing counts from two processes.
 
 ## Control behaviour
 
@@ -341,7 +395,7 @@ followed by capability JSON. Every reply is `OK <payload>` or `ERR <message>`.
 | --- | --- |
 | Discover | `PING`, `CAPS`, `HARDWARE GET`, `PLATFORM GET` |
 | Profile | `PROFILE <raw-token-from-CAPS>` |
-| Fans | `FAN AUTO`, `FAN MAXIMUM`, `FAN MANUAL <cpu-20..100> <gpu-20..100>` |
+| Fans | `FAN AUTO`, `FAN MAXIMUM`, `FAN MANUAL <cpu-20..100> <gpu-20..100>`, `FAN CURVE GET`, `FAN CURVE SET <cpu-points> <gpu-points>`, `FAN EMERGENCY GET`, `FAN EMERGENCY SET <cpu-limit> <gpu-limit>` |
 | Lighting | `LIGHTING APPLY <device-id> <OFF\|STATIC\|BREATHING\|NEON> <brightness-0..100> <speed-0..9> <RRGGBB> <-\|RRGGBB,...>`, `LIGHTING POWER <device-id> <ON\|OFF>` |
 | Platform toggles | `PLATFORM <BATTERY_LIMIT\|KEYBOARD_TIMEOUT\|BOOT_SOUND\|LCD_OVERRIDE> <ON\|OFF>` |
 | Other platform controls | `PLATFORM BATTERY_CALIBRATION <START\|STOP>`, `PLATFORM USB_CHARGING <0\|10\|20\|30>`, `PLATFORM REAR_LOGO <RRGGBB> <brightness-0..100> <ON\|OFF>` |
@@ -378,3 +432,14 @@ ASense is provided **AS IS** and is licensed **GPL-2.0-only**. See
 documented by
 [`predator-sense`](https://github.com/cleyton1986/predator-sense); ASense uses
 its own implementation and tests.
+
+`FAN CURVE SET` uses comma-separated `temperature:percentage` lists, for example
+`FAN CURVE SET 45:30,55:40,65:60,75:80,85:100 40:30,50:40,60:60,70:80,78:100`.
+It validates, activates, and saves the curve. `FAN CURVE GET` returns JSON with
+`config`, `state`, `requested` percentages, and `fault`; these commands are
+additions to control protocol version 2.
+
+`FAN EMERGENCY GET` reports saved limits, software protection state, latest
+temperatures and sample age, trigger reason, and safe recovery sample count.
+`FAN EMERGENCY SET` validates and atomically saves limits without changing curve
+points or enabled state. Older daemons disable the Emergency editor gracefully.

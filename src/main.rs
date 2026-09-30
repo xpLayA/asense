@@ -4,7 +4,9 @@ mod gui_instance;
 // Keep the GUI module's existing `crate::…` paths as thin aliases into the
 // shared GUI-free library.  `asensed` links the same library without enabling
 // any desktop dependency.
-pub use asense_core::{control, hardware, lighting, nvidia, platform, probe, telemetry, tuning};
+pub use asense_core::{
+    control, fan_curve, hardware, lighting, nvidia, platform, probe, telemetry, tuning,
+};
 
 use std::env;
 

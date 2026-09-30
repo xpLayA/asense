@@ -81,6 +81,7 @@ OLD_MODULE_LOADED=0
 OLD_SOCKET_ACTIVE=0
 OLD_SOCKET_ENABLED=0
 OLD_SERVICE_ACTIVE=0
+OLD_SERVICE_ENABLED=0
 OLD_MODULE_PATH=""
 
 PACKAGE_PATHS=(
@@ -453,6 +454,11 @@ restore_old_package() {
   if ((OLD_SOCKET_ACTIVE)); then
     asense_root systemctl start asense.socket || true
   fi
+  if ((OLD_SERVICE_ENABLED)); then
+    asense_root systemctl enable asense.service || true
+  else
+    asense_root systemctl disable asense.service 2>/dev/null || true
+  fi
   if ((OLD_SERVICE_ACTIVE)); then
     asense_root systemctl start asense.service || true
   fi
@@ -547,6 +553,7 @@ fi
 asense_root systemctl is-active --quiet asense.socket && OLD_SOCKET_ACTIVE=1 || true
 asense_root systemctl is-enabled --quiet asense.socket && OLD_SOCKET_ENABLED=1 || true
 asense_root systemctl is-active --quiet asense.service && OLD_SERVICE_ACTIVE=1 || true
+asense_root systemctl is-enabled --quiet asense.service && OLD_SERVICE_ENABLED=1 || true
 [[ -d /sys/module/asense_rgb ]] && OLD_MODULE_LOADED=1
 OLD_MODULE_PATH="$(modinfo -n asense_rgb 2>/dev/null || true)"
 [[ "$OLD_MODULE_PATH" == /* ]] || OLD_MODULE_PATH=""
@@ -640,6 +647,7 @@ if ((IS_REFERENCE_MODEL)); then
 fi
 asense_root systemctl daemon-reload
 asense_root systemctl enable --now asense.socket
+asense_root systemctl enable --now asense.service
 asense_root systemctl is-active --quiet asense.socket || asense_die "asense.socket is not active"
 verify_control_service
 asense_refresh_desktop_caches

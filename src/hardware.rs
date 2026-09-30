@@ -539,6 +539,27 @@ impl AcerHardware {
         })
     }
 
+    /// Update an existing Manual session without cycling through Maximum.
+    pub(crate) fn update_manual_fan_speeds(&self, cpu: u8, gpu: u8) -> Result<(), HardwareError> {
+        self.require_acer()?;
+        validate_percent("CPU fan percent", cpu)?;
+        validate_percent("GPU fan percent", gpu)?;
+        self.verify_mode(1, FanMode::Manual)?;
+        self.verify_mode(2, FanMode::Manual)?;
+        self.write_speed_percent(1, cpu)?;
+        self.write_speed_percent(2, gpu)?;
+        self.verify_pwm_percent(1, cpu)?;
+        self.verify_pwm_percent(2, gpu)?;
+        self.verify_mode(1, FanMode::Manual)?;
+        self.verify_mode(2, FanMode::Manual)
+    }
+
+    /// Emergency mode verification must not depend on optional PWM/RPM reads.
+    pub(crate) fn apply_maximum_failsafe(&self) -> Result<(), HardwareError> {
+        self.require_acer()?;
+        self.force_maximum_unchecked()
+    }
+
     pub(crate) fn read_acer_temp_millidegrees(&self, channel: u8) -> Result<i64, HardwareError> {
         let base = self
             .hwmon
@@ -546,6 +567,11 @@ impl AcerHardware {
             .ok_or(HardwareError::AcerHwmonNotFound)?;
         let path = acer_temperature_path(base, channel);
         parse_value(&path, "temperature")
+    }
+
+    pub fn refresh_telemetry_interfaces(&mut self) {
+        // Module loading/reloading can introduce or renumber optional hwmon nodes.
+        self.hwmon = discover_acer_hwmon(&self.root);
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -836,7 +862,7 @@ fn is_acer_hwmon_identity(identity: &str) -> bool {
             .to_ascii_lowercase()
             .replace('_', "-")
             .as_str(),
-        "acer" | "acer-wmi"
+        "acer" | "acer-wmi" | "asense" | "asense-rgb"
     )
 }
 
@@ -937,7 +963,7 @@ fn discover_kernel_fan_interface(hwmon: Option<&Path>) -> Option<FanInterface> {
     None
 }
 
-fn discover_gaming_wmi_fan_interface(root: &Path, hwmon: Option<&Path>) -> Option<FanInterface> {
+fn discover_gaming_wmi_fan_interface(root: &Path, _hwmon: Option<&Path>) -> Option<FanInterface> {
     let base = find_wmi_group(
         &rooted(root, "sys/bus/wmi/devices"),
         GAMING_WMI_GUID,
@@ -954,16 +980,11 @@ fn discover_gaming_wmi_fan_interface(root: &Path, hwmon: Option<&Path>) -> Optio
     if !behavior_is_readable {
         return None;
     }
-    let temperatures_are_readable = hwmon.is_some_and(|base| {
-        (1_u8..=2).all(|channel| {
-            parse_value::<i64>(&acer_temperature_path(base, channel), "temperature").is_ok()
-        })
+    // The daemon validates watchdog sensors (including coretemp/NVML) before
+    // taking Manual ownership. Capability discovery must remain passive.
+    let manual = ["cpu_speed", "gpu_speed"].into_iter().all(|name| {
+        parse_value::<u8>(&base.join(name), "Gaming-WMI fan speed").is_ok_and(|value| value <= 100)
     });
-    let manual = temperatures_are_readable
-        && ["cpu_speed", "gpu_speed"].into_iter().all(|name| {
-            parse_value::<u8>(&base.join(name), "Gaming-WMI fan speed")
-                .is_ok_and(|value| value <= 100)
-        });
     Some(FanInterface::AcerGamingWmi { base, manual })
 }
 
@@ -1463,6 +1484,37 @@ mod tests {
     }
 
     #[test]
+    fn asense_read_only_sensors_refresh_without_claiming_pwm_control() {
+        let fixture = Fixture::new();
+        let mut hardware = AcerHardware::discover_at(&fixture.root).unwrap();
+        fs::remove_dir_all(fixture.hwmon()).unwrap();
+        hardware.refresh_telemetry_interfaces();
+        assert!(hardware.fan_rpm_channels().is_empty());
+        let hwmon = fixture.root.join("sys/class/hwmon/hwmon18");
+        fs::create_dir_all(&hwmon).unwrap();
+        for (name, value) in [
+            ("name", "asense"),
+            ("fan1_input", "3100"),
+            ("fan2_input", "2600"),
+            ("fan1_label", "CPU"),
+            ("fan2_label", "GPU"),
+            ("temp1_input", "72000"),
+            ("temp2_input", "61000"),
+        ] {
+            fs::write(hwmon.join(name), value).unwrap();
+        }
+        hardware.refresh_telemetry_interfaces();
+        assert_eq!(hardware.fan_rpm_channels()[0].rpm, Some(3100));
+        fs::write(hwmon.join("fan1_input"), "5400").unwrap();
+        assert_eq!(hardware.fan_rpm_channels()[0].rpm, Some(5400));
+        assert_eq!(hardware.read_acer_temp_millidegrees(2).unwrap(), 61000);
+        fs::write(hwmon.join("fan2_input"), "invalid").unwrap();
+        assert_eq!(hardware.fan_rpm_channels()[1].rpm, None);
+        let rediscovered = AcerHardware::discover_at(&fixture.root).unwrap();
+        assert!(rediscovered.capabilities().fans.backend.is_none());
+    }
+
+    #[test]
     fn temperature_roles_follow_hwmon_labels_instead_of_file_order() {
         let fixture = Fixture::new();
         fs::write(fixture.hwmon().join("temp1_label"), "GPU\n").unwrap();
@@ -1515,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn gaming_wmi_manual_requires_both_watchdog_temperatures() {
+    fn gaming_wmi_manual_capability_does_not_require_acer_only_sensors() {
         let fixture = Fixture::new();
         fs::remove_file(fixture.hwmon().join("pwm2_enable")).unwrap();
         fs::remove_file(fixture.hwmon().join("temp2_input")).unwrap();
@@ -1526,7 +1578,7 @@ mod tests {
             .fans;
         assert_eq!(fans.backend, Some(FanBackend::AcerGamingWmi));
         assert!(fans.auto && fans.maximum);
-        assert!(!fans.manual);
+        assert!(fans.manual);
     }
 
     #[test]

@@ -8,6 +8,7 @@ case "$1" in
         if [ -d /run/systemd/system ]; then
             deb-systemd-invoke stop asense.socket >/dev/null 2>&1 || true
         fi
+        deb-systemd-helper disable asense.service >/dev/null 2>&1 || true
         deb-systemd-helper disable asense.socket >/dev/null 2>&1 || true
         ;;
 esac
@@ -20,6 +21,7 @@ case "$1" in
         if [ -d /var/lib/asense ] && [ ! -L /var/lib/asense ]; then
             find /var/lib/asense -xdev -depth -delete
         fi
+        deb-systemd-helper purge asense.service >/dev/null 2>&1 || true
         deb-systemd-helper purge asense.socket >/dev/null 2>&1 || true
         systemd-hwdb update >/dev/null 2>&1 || true
         udevadm control --reload-rules >/dev/null 2>&1 || true

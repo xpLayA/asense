@@ -2,6 +2,15 @@
 # systemd-sleep hook: the kernel driver restores the cached RGB engine state;
 # the root helper reconciles fan safety and the optional NVIDIA OEM offsets.
 
+if [ "${1:-}" = "pre" ] && systemctl --quiet is-active asense.service; then
+    for helper in "${ASENSE_SLEEP_HELPER:-/usr/libexec/asense/asensed}" /usr/lib/asense/asensed; do
+        if [ -x "$helper" ]; then
+            "$helper" --suspend || logger -t asense "pre-suspend fan reset failed"
+            break
+        fi
+    done
+fi
+
 if [ "${1:-}" = "post" ] && systemctl --quiet is-active asense.service; then
     systemctl reload asense.service ||
         logger -t asense "post-resume reconciliation failed"

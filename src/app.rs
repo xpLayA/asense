@@ -20,6 +20,7 @@ use crate::control::{
     ControlCapabilities, ControlClient, ControlError, ControlLightingDevice, ControlLightingMode,
     ControlLightingModes, ControlProfileChoice, ControlResult, ProfileApplyReceipt,
 };
+use crate::fan_curve::{CurveConfig, CurvePoint, CurveStatus, EmergencyConfig, EmergencyStatus};
 use crate::hardware::{
     AcerHardware, FanMode as HardwareFanMode, PlatformProfile as HardwareProfile,
 };
@@ -846,6 +847,9 @@ enum ControlAction {
     Initialize,
     FanMode(FanMode),
     ManualFans(ManualFanRequest),
+    CurveApply(CurveConfig),
+    EmergencyApply(EmergencyConfig),
+    CurvePoll,
     Profile(String),
     LightingApply(LightingApplyRequest),
     LightingPower(LightingPowerRequest),
@@ -861,7 +865,11 @@ impl ControlAction {
     fn error_kind(&self) -> UiErrorKind {
         match self {
             Self::Initialize => UiErrorKind::Initialization,
-            Self::FanMode(_) | Self::ManualFans(_) => UiErrorKind::Fan,
+            Self::FanMode(_)
+            | Self::ManualFans(_)
+            | Self::CurveApply(_)
+            | Self::EmergencyApply(_)
+            | Self::CurvePoll => UiErrorKind::Fan,
             Self::Profile(_) => UiErrorKind::Profile,
             Self::LightingApply(_) | Self::LightingPower(_) => UiErrorKind::Lighting,
             Self::Platform(_) => UiErrorKind::Platform,
@@ -894,12 +902,20 @@ impl ControlRequest {
 
 #[derive(Debug)]
 enum ControlOutcome {
+    Curve(Option<CurveStatus>),
+    Emergency(Option<EmergencyStatus>),
+    Cooling {
+        curve: Option<CurveStatus>,
+        emergency: Option<EmergencyStatus>,
+    },
     RefreshedThen {
         refresh: Box<ControlOutcome>,
         result: Result<Box<ControlOutcome>, String>,
     },
     Initialize {
         capabilities: ControlCapabilities,
+        curve: Option<CurveStatus>,
+        emergency: Option<EmergencyStatus>,
         lighting: Result<KeyboardLightingState, String>,
         memory_hardware: Result<MemoryHardwareInfo, String>,
         platform: Result<PlatformState, String>,
@@ -921,6 +937,8 @@ enum ControlOutcome {
     },
     Refresh {
         capabilities: ControlCapabilities,
+        curve: Option<CurveStatus>,
+        emergency: Option<EmergencyStatus>,
         lighting: Result<KeyboardLightingState, String>,
         platform: Result<PlatformState, String>,
     },
@@ -1027,6 +1045,29 @@ impl ControlWorker {
     }
 }
 
+#[derive(Default)]
+struct CoolingPollClock {
+    pending: AtomicBool,
+    waker: AtomicWaker,
+}
+impl CoolingPollClock {
+    fn tick(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+    async fn receive(&self) {
+        poll_fn(|context| {
+            self.waker.register(context.waker());
+            if self.pending.swap(false, Ordering::AcqRel) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
 #[component]
 fn Root() -> Element {
     let desktop = use_window();
@@ -1089,6 +1130,46 @@ fn Root() -> Element {
 
     let telemetry_slot = use_hook(TelemetrySlot::default);
     let telemetry_receiver = telemetry_slot.clone();
+    let cooling_clock = use_hook(|| Arc::new(CoolingPollClock::default()));
+    let weak_clock = Arc::downgrade(&cooling_clock);
+    use_hook(move || {
+        if let Err(error) = std::thread::Builder::new()
+            .name("asense-cooling-poll".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Some(clock) = weak_clock.upgrade() else {
+                        break;
+                    };
+                    clock.tick();
+                }
+            })
+        {
+            eprintln!("asense cooling poll could not start: {error}");
+        }
+    });
+    let cooling_worker = control_worker.clone();
+    let _cooling_updates = use_future(move || {
+        let clock = cooling_clock.clone();
+        let worker = cooling_worker.clone();
+        async move {
+            loop {
+                clock.receive().await;
+                let poll = {
+                    let state = runtime.read();
+                    state.view.controls_enabled
+                        && (state.view.curve.is_some() || state.view.emergency.is_some())
+                };
+                if poll {
+                    queue_control_request(
+                        runtime,
+                        &worker,
+                        ControlRequest::background(ControlAction::CurvePoll),
+                    );
+                }
+            }
+        }
+    });
     let resume_control_worker = control_worker.clone();
     let pending_capability_refresh = use_hook(|| Arc::new(AtomicBool::new(false)));
     let pending_refresh = pending_capability_refresh.clone();
@@ -1179,9 +1260,10 @@ fn Root() -> Element {
                     }
                 }
 
-                let Some(active_hardware) = hardware.as_ref() else {
+                let Some(active_hardware) = hardware.as_mut() else {
                     continue;
                 };
+                active_hardware.refresh_telemetry_interfaces();
                 match reader.sample(active_hardware) {
                     Ok(sample) => {
                         consecutive_failures = 0;
@@ -1213,6 +1295,8 @@ fn Root() -> Element {
     let state = runtime.read().view.clone();
     let fan_mode_worker = control_worker.clone();
     let manual_fans_worker = control_worker.clone();
+    let curve_worker = control_worker.clone();
+    let emergency_worker = control_worker.clone();
     let profile_worker = control_worker.clone();
     let lighting_worker = control_worker.clone();
     let lighting_power_worker = control_worker.clone();
@@ -1236,6 +1320,8 @@ fn Root() -> Element {
                         advanced_open: advanced_open(),
                         on_fan_mode: move |mode| set_fan_mode(runtime, &fan_mode_worker, mode),
                         on_manual_fans: move |request| set_manual_fans(runtime, &manual_fans_worker, request),
+                        on_curve: move |config| { queue_control_request(runtime, &curve_worker, ControlRequest::foreground(ControlAction::CurveApply(config))); },
+                        on_emergency: move |config| { queue_control_request(runtime, &emergency_worker, ControlRequest::foreground(ControlAction::EmergencyApply(config))); },
                         on_profile: move |profile| set_platform_profile(runtime, &profile_worker, profile),
                         on_lighting: move |request| apply_lighting(runtime, &lighting_worker, request),
                         on_lighting_power: move |request| set_lighting_power(
@@ -1463,6 +1549,20 @@ fn execute_control_action_inner(
     action: ControlAction,
 ) -> Result<ControlOutcome, String> {
     match action {
+        ControlAction::CurveApply(config) => {
+            with_control(control, |client| client.set_fan_curve(&config))
+                .map(|status| ControlOutcome::Curve(Some(status)))
+        }
+        ControlAction::EmergencyApply(config) => {
+            with_control(control, |client| client.set_emergency(&config))
+                .map(|status| ControlOutcome::Emergency(Some(status)))
+        }
+        ControlAction::CurvePoll => with_control(control, |client| {
+            Ok(ControlOutcome::Cooling {
+                curve: curve_snapshot(client)?,
+                emergency: emergency_snapshot(client)?,
+            })
+        }),
         ControlAction::Initialize => match initialize_control(control) {
             Ok(first) => Ok(first),
             Err(_) => {
@@ -1472,6 +1572,9 @@ fn execute_control_action_inner(
         },
         ControlAction::FanMode(mode) => with_control(control, |client| match mode {
             FanMode::Auto => client.fan_auto(),
+            FanMode::Curve => Err(ControlError::InvalidRequest(
+                "apply explicit curve points".into(),
+            )),
             FanMode::Manual => Err(ControlError::InvalidRequest(
                 "manual fan mode requires explicit fan speeds".to_string(),
             )),
@@ -1535,14 +1638,34 @@ fn execute_control_action_inner(
     }
 }
 
+fn curve_snapshot(client: &mut ControlClient) -> ControlResult<Option<CurveStatus>> {
+    match client.fan_curve() {
+        Ok(status) => Ok(Some(status)),
+        Err(ControlError::CommandRejected(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn emergency_snapshot(client: &mut ControlClient) -> ControlResult<Option<EmergencyStatus>> {
+    match client.emergency() {
+        Ok(status) => Ok(Some(status)),
+        Err(ControlError::CommandRejected(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn initialize_control(control: &mut Option<ControlClient>) -> Result<ControlOutcome, String> {
     with_control(control, |client| {
         let capabilities = client.capabilities()?;
+        let curve = curve_snapshot(client)?;
+        let emergency = emergency_snapshot(client)?;
         let lighting = partial_control_result(keyboard_lighting_snapshot(client, &capabilities))?;
         let memory_hardware = partial_control_result(client.memory_hardware_info())?;
         let platform = partial_control_result(platform_snapshot(client, &capabilities))?;
         Ok(ControlOutcome::Initialize {
             capabilities,
+            curve,
+            emergency,
             lighting,
             memory_hardware,
             platform,
@@ -1568,10 +1691,14 @@ fn reconnect_control(control: &mut Option<ControlClient>) -> Result<ControlOutco
     }
     with_control(control, |client| {
         let capabilities = client.capabilities()?;
+        let curve = curve_snapshot(client)?;
+        let emergency = emergency_snapshot(client)?;
         let lighting = partial_control_result(keyboard_lighting_snapshot(client, &capabilities))?;
         let platform = partial_control_result(platform_snapshot(client, &capabilities))?;
         Ok(ControlOutcome::Refresh {
             capabilities,
+            curve,
+            emergency,
             lighting,
             platform,
         })
@@ -1597,9 +1724,10 @@ fn queue_control_request(
 }
 
 fn begin_control_request(view: &mut AppState, request: ControlRequest) -> bool {
-    if view.control_busy {
+    if view.control_busy && !(view.curve_polling && request.foreground) {
         return false;
     }
+    view.curve_polling = request.action == ControlAction::CurvePoll;
     view.control_busy = true;
     if request.action.touches_platform() {
         view.platform_busy = true;
@@ -1614,7 +1742,10 @@ fn begin_control_request(view: &mut AppState, request: ControlRequest) -> bool {
 }
 
 fn fail_control_request(view: &mut AppState, request: ControlRequest, error: String) {
-    view.control_busy = false;
+    if request.action != ControlAction::CurvePoll || view.curve_polling {
+        view.control_busy = false;
+        view.curve_polling = false;
+    }
     let error_kind = request.action.error_kind();
     let detail = RawDetail::new(error);
     if request.action.touches_platform() {
@@ -1636,7 +1767,10 @@ fn fail_control_request(view: &mut AppState, request: ControlRequest, error: Str
 }
 
 fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
-    view.control_busy = false;
+    if update.request.action != ControlAction::CurvePoll || view.curve_polling {
+        view.control_busy = false;
+        view.curve_polling = false;
+    }
     if update.request.action.touches_platform() {
         view.platform_busy = false;
     }
@@ -1685,10 +1819,14 @@ fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
         }
         ControlOutcome::Initialize {
             capabilities,
+            curve,
+            emergency,
             lighting,
             memory_hardware,
             platform,
         } => {
+            view.curve = curve;
+            view.emergency = emergency;
             let (acer_controls, mut diagnostics) =
                 apply_capability_snapshot(view, capabilities, lighting, platform);
             match memory_hardware {
@@ -1714,11 +1852,52 @@ fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
                 view.status = UiStatus::PartialCapabilities(diagnostics);
             }
         }
+        ControlOutcome::Emergency(status) => {
+            view.emergency = status;
+            if update.request.foreground {
+                finish_control_success(view, UiStatus::SettingsConfirmed);
+            }
+        }
+        ControlOutcome::Cooling { curve, emergency } => {
+            apply_control_update(
+                view,
+                ControlUpdate {
+                    request: update.request.clone(),
+                    result: Ok(ControlOutcome::Curve(curve)),
+                },
+            );
+            view.emergency = emergency;
+        }
+        ControlOutcome::Curve(status) => {
+            view.curve = status;
+            if let Some(curve) = &view.curve {
+                if curve.config.enabled {
+                    view.fan_mode = FanMode::Curve;
+                }
+                if let Some([cpu, gpu]) = curve.requested {
+                    view.cpu_fan_percent = cpu;
+                    view.gpu_fan_percent = gpu;
+                }
+            }
+            if update.request.foreground {
+                finish_control_success(view, UiStatus::SettingsConfirmed);
+            }
+        }
         ControlOutcome::FanMode(mode) => {
+            if let Some(curve) = &mut view.curve {
+                curve.config.enabled = false;
+                curve.state = "disabled".into();
+                curve.fault = None;
+            }
             view.fan_mode = mode;
             finish_control_success(view, UiStatus::SettingsConfirmed);
         }
         ControlOutcome::ManualFans(request) => {
+            if let Some(curve) = &mut view.curve {
+                curve.config.enabled = false;
+                curve.state = "disabled".into();
+                curve.fault = None;
+            }
             view.fan_mode = FanMode::Manual;
             view.cpu_fan_percent = request.cpu_percent;
             view.gpu_fan_percent = request.gpu_percent;
@@ -1786,9 +1965,13 @@ fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
         },
         ControlOutcome::Refresh {
             capabilities,
+            curve,
+            emergency,
             lighting,
             platform,
         } => {
+            view.curve = curve;
+            view.emergency = emergency;
             let (_, diagnostics) =
                 apply_capability_snapshot(view, capabilities, lighting, platform);
             if diagnostics.is_empty() {
@@ -1869,6 +2052,23 @@ fn store_platform_state(view: &mut AppState, platform: PlatformState) -> Option<
 fn finish_control_success(view: &mut AppState, status: UiStatus) {
     view.health = HealthState::Healthy;
     view.status = status;
+}
+
+fn curve_state_label(state: &str) -> &str {
+    match state {
+        "running" => "Running",
+        "sensor-hold" => "Sensor fault — holding speed",
+        "sensor-fault" => "Sensor fault — cooling fallback",
+        "control-fault" => "Fan control fault",
+        "emergency" => "Thermal emergency",
+        "starting" => "Starting",
+        "paused" => "Paused",
+        "unavailable" => "Hardware unavailable",
+        "disabled" => "Disabled",
+        "monitoring" => "Monitoring",
+        "firmware-managed" => "Firmware managed",
+        other => other,
+    }
 }
 
 fn lighting_apply_status(state_readable: bool) -> UiStatus {
@@ -2123,8 +2323,19 @@ fn apply_telemetry(view: &mut AppState, sample: SystemTelemetry) {
             view.platform_profile = profile;
         }
     }
+    if view
+        .curve
+        .as_ref()
+        .is_some_and(|curve| curve.config.enabled)
+    {
+        view.fan_mode = FanMode::Curve;
+    }
     if let (Some(cpu_mode), Some(gpu_mode)) = (sample.fans.cpu.mode, sample.fans.gpu.mode)
         && cpu_mode == gpu_mode
+        && !view
+            .curve
+            .as_ref()
+            .is_some_and(|curve| curve.config.enabled)
     {
         view.fan_mode = match cpu_mode {
             HardwareFanMode::Automatic => FanMode::Auto,
@@ -2152,6 +2363,7 @@ fn merge_privileged_memory(current: &mut MemoryHardwareInfo, privileged: MemoryH
 pub enum FanMode {
     #[default]
     Auto,
+    Curve,
     Manual,
     Maximum,
 }
@@ -2161,14 +2373,16 @@ enum DockTab {
     #[default]
     Fans,
     Keyboard,
+    Emergency,
 }
 
 impl FanMode {
-    const ALL: [Self; 3] = [Self::Auto, Self::Manual, Self::Maximum];
+    const ALL: [Self; 4] = [Self::Auto, Self::Curve, Self::Manual, Self::Maximum];
 
     fn label(self, language: Language) -> &'static str {
         match self {
-            Self::Auto => text(language, MessageId::FanModeAuto),
+            Self::Auto => "Firmware Auto",
+            Self::Curve => "Auto Curve",
             Self::Manual => text(language, MessageId::AppLabel001),
             Self::Maximum => text(language, MessageId::FanModeMaximum),
         }
@@ -2177,6 +2391,9 @@ impl FanMode {
     fn hint(self, language: Language) -> &'static str {
         match self {
             Self::Auto => text(language, MessageId::AppHint001),
+            Self::Curve => {
+                "Edit temperature curves; runs in the background and resumes after reboot"
+            }
             Self::Manual => text(language, MessageId::AppHint002),
             Self::Maximum => text(language, MessageId::AppHint003),
         }
@@ -2457,6 +2674,9 @@ pub struct AppState {
     pub hardware: HardwareInfo,
     pub history: TelemetryHistory,
     pub fan_mode: FanMode,
+    pub curve: Option<CurveStatus>,
+    pub emergency: Option<EmergencyStatus>,
+    curve_polling: bool,
     pub cpu_fan_percent: u8,
     pub gpu_fan_percent: u8,
     pub platform_profile: PlatformProfile,
@@ -2493,6 +2713,9 @@ impl Default for AppState {
             hardware: HardwareInfo::default(),
             history: TelemetryHistory::default(),
             fan_mode: FanMode::Auto,
+            curve: None,
+            emergency: None,
+            curve_polling: false,
             cpu_fan_percent: 50,
             gpu_fan_percent: 50,
             platform_profile: PlatformProfile::Balanced,
@@ -2548,6 +2771,8 @@ fn Dashboard(
     advanced_open: bool,
     on_fan_mode: EventHandler<FanMode>,
     on_manual_fans: EventHandler<ManualFanRequest>,
+    on_curve: EventHandler<CurveConfig>,
+    on_emergency: EventHandler<EmergencyConfig>,
     on_profile: EventHandler<String>,
     on_lighting: EventHandler<LightingApplyRequest>,
     on_lighting_power: EventHandler<LightingPowerRequest>,
@@ -2601,7 +2826,7 @@ fn Dashboard(
                     model_name: state.model_name,
                     health: displayed_health,
                     status_message: status_title.clone(),
-                    control_busy: state.control_busy,
+                    control_busy: state.control_busy && !state.curve_polling,
                     language,
                     advanced_open,
                     on_info: move |_| docs_open.set(true),
@@ -2625,6 +2850,8 @@ fn Dashboard(
 
                 ControlDock {
                     fan_mode: state.fan_mode,
+                    curve: state.curve.clone(),
+                    emergency: state.emergency.clone(),
                     cpu_fan_percent: state.cpu_fan_percent,
                     gpu_fan_percent: state.gpu_fan_percent,
                     platform_profile: state.platform_profile,
@@ -2633,12 +2860,14 @@ fn Dashboard(
                     lighting: state.lighting,
                     last_applied_lighting: state.last_applied_lighting,
                     lighting_error: state.lighting_error,
-                    control_busy: state.control_busy,
+                    control_busy: state.control_busy && !state.curve_polling,
                     controls_enabled: state.controls_enabled,
                     health: state.health,
                     language,
                     on_fan_mode,
                     on_manual_fans,
+                    on_curve,
+                    on_emergency,
                     on_profile,
                     on_lighting,
                     on_lighting_power,
@@ -2829,7 +3058,7 @@ fn fan_mode_supported(
 ) -> bool {
     capabilities.is_none_or(|capabilities| match mode {
         FanMode::Auto => capabilities.auto,
-        FanMode::Manual => capabilities.manual,
+        FanMode::Curve | FanMode::Manual => capabilities.manual,
         FanMode::Maximum => capabilities.maximum,
     })
 }
@@ -2949,8 +3178,92 @@ fn lighting_target_label(target: CapabilityLightingTarget, language: Language) -
 }
 
 #[component]
+fn CurveEditor(
+    config: CurveConfig,
+    fault: Option<String>,
+    enabled: bool,
+    on_apply: EventHandler<CurveConfig>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let mut draft = use_signal(move || config);
+    let validation = draft.read().validate().err();
+    rsx! {
+        div { class: "curve-overlay",
+            div { class: "curve-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Edit automatic fan curves",
+                h2 { "Auto Curve" }
+                if let Some(error) = fault { p { class: "curve-error", "{error}" } }
+                p { "Runs in the background, including after closing ASense. Enabled curves resume after reboot." }
+                div { class: "curve-columns",
+                    for (channel, label) in [(0, "CPU"), (1, "GPU")] {
+                        div { class: "curve-channel",
+                            h3 { "{label}" }
+                            div { class: "curve-point curve-heading", span { "Temperature °C" } span { "Fan speed %" } }
+                            for (index, point) in (if channel == 0 { draft.read().cpu.clone() } else { draft.read().gpu.clone() }).into_iter().enumerate() {
+                                div { class: "curve-point", key: "{channel}-{index}",
+                                    input { r#type: "number", min: "20", max: if channel == 0 { "85" } else { "78" },
+                                        value: "{point.temperature}", "aria-label": "{label} point {index} temperature",
+                                        disabled: !enabled,
+                                        oninput: move |event| {
+                                            if let Ok(value) = event.value().parse::<u8>() {
+                                                let mut config = draft.write();
+                                                let points = if channel == 0 { &mut config.cpu } else { &mut config.gpu };
+                                                points[index].temperature = value;
+                                            }
+                                        },
+                                    }
+                                    input { r#type: "number", min: "20", max: "100", value: "{point.percent}",
+                                        "aria-label": "{label} point {index} fan percentage", disabled: !enabled,
+                                        oninput: move |event| {
+                                            if let Ok(value) = event.value().parse::<u8>() {
+                                                let mut config = draft.write();
+                                                let points = if channel == 0 { &mut config.cpu } else { &mut config.gpu };
+                                                points[index].percent = value;
+                                            }
+                                        },
+                                    }
+                                    button { r#type: "button", disabled: !enabled || (if channel == 0 { draft.read().cpu.len() } else { draft.read().gpu.len() }) <= 2,
+                                        onclick: move |_| {
+                                            let mut config = draft.write();
+                                            let points = if channel == 0 { &mut config.cpu } else { &mut config.gpu };
+                                            if points.len() > 2 { points.remove(index); }
+                                        }, "Remove"
+                                    }
+                                }
+                            }
+                            button { r#type: "button", disabled: !enabled || (if channel == 0 { draft.read().cpu.len() } else { draft.read().gpu.len() }) >= 8,
+                                onclick: move |_| {
+                                    let mut config = draft.write();
+                                    let points = if channel == 0 { &mut config.cpu } else { &mut config.gpu };
+                                    if points.len() < 8
+                                        && let Some(index) = points.windows(2).position(|p| p[1].temperature > p[0].temperature.saturating_add(1)) {
+                                        let point = CurvePoint { temperature: ((u16::from(points[index].temperature) + u16::from(points[index+1].temperature)) / 2) as u8, percent: ((u16::from(points[index].percent) + u16::from(points[index+1].percent)) / 2) as u8 };
+                                        points.insert(index + 1, point);
+                                    }
+                                }, "Add point"
+                            }
+                        }
+                    }
+                }
+                p { "Use 2–8 increasing temperatures per fan, with nondecreasing speeds. End at 100% by 85°C CPU / 78°C GPU." }
+                if let Some(error) = validation.as_ref() { p { class: "curve-error", "{error}" } }
+                div { class: "curve-actions",
+                    button { r#type: "button", disabled: !enabled, onclick: move |_| draft.set(CurveConfig::default()), "Reset defaults" }
+                    button { r#type: "button", onclick: move |_| on_close.call(()), "Cancel" }
+                    button { class: "apply-button", r#type: "button", disabled: !enabled || validation.is_some(),
+                        onclick: move |_| { let mut config = draft.read().clone(); config.enabled = true; on_apply.call(config); },
+                        "Apply and enable"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn ControlDock(
     fan_mode: FanMode,
+    curve: Option<CurveStatus>,
+    emergency: Option<EmergencyStatus>,
     cpu_fan_percent: u8,
     gpu_fan_percent: u8,
     platform_profile: PlatformProfile,
@@ -2965,6 +3278,8 @@ fn ControlDock(
     language: Language,
     on_fan_mode: EventHandler<FanMode>,
     on_manual_fans: EventHandler<ManualFanRequest>,
+    on_curve: EventHandler<CurveConfig>,
+    on_emergency: EventHandler<EmergencyConfig>,
     on_profile: EventHandler<String>,
     on_lighting: EventHandler<LightingApplyRequest>,
     on_lighting_power: EventHandler<LightingPowerRequest>,
@@ -2979,6 +3294,7 @@ fn ControlDock(
         lighting_devices.swap(0, preferred);
     }
 
+    let mut curve_editor_open = use_signal(|| false);
     let mut cpu_draft = use_signal(move || cpu_fan_percent);
     let mut gpu_draft = use_signal(move || gpu_fan_percent);
     let initial_manual = fan_mode == FanMode::Manual;
@@ -3081,14 +3397,18 @@ fn ControlDock(
         .is_none_or(|capabilities| capabilities.backend.is_some());
     let supported_fan_modes = FanMode::ALL
         .into_iter()
-        .filter(|mode| fan_mode_supported(fan_capabilities.as_ref(), *mode))
+        .filter(|mode| {
+            fan_mode_supported(fan_capabilities.as_ref(), *mode)
+                && (*mode != FanMode::Curve || curve.is_some())
+        })
         .collect::<Vec<_>>();
+    let fan_mode_columns = supported_fan_modes.len();
     let lighting_available = !lighting_devices.is_empty();
     let lighting_drafts = lighting_devices
         .iter()
         .map(|device| lighting_draft_for_device(device, &lighting, &last_applied_lighting))
         .collect::<Vec<_>>();
-    let dock_column_count = 1 + lighting_devices.len().max(1);
+    let dock_column_count = 2 + lighting_devices.len().max(1);
     let lighting_modes = keyboard_device.as_ref().map(|device| device.modes);
     let (show_static, show_brightness, show_breathing, show_neon) =
         lighting_mode_visibility(lighting_modes);
@@ -3174,6 +3494,13 @@ fn ControlDock(
                     onclick: move |_| dock_tab.set(DockTab::Fans),
                     {text(language, MessageId::AppControlDock010)}
                 }
+                button {
+                    class: if dock_tab() == DockTab::Emergency { "dock-tab active" } else { "dock-tab" },
+                    r#type: "button", role: "tab",
+                    "aria-selected": dock_tab() == DockTab::Emergency,
+                    onclick: move |_| dock_tab.set(DockTab::Emergency),
+                    "Emergency"
+                }
                 if lighting_devices.is_empty() {
                     button {
                         class: if dock_tab() == DockTab::Keyboard { "dock-tab active" } else { "dock-tab" },
@@ -3213,7 +3540,9 @@ fn ControlDock(
             }
 
             div { class: "dock-content",
-                if dock_tab() == DockTab::Keyboard {
+                if dock_tab() == DockTab::Emergency {
+                    EmergencyPanel { status: emergency.clone(), enabled, on_apply: on_emergency }
+                } else if dock_tab() == DockTab::Keyboard {
                     div { class: "keyboard-panel",
                         div { class: "lighting-power", "aria-label": text(language, MessageId::AppControlDock013),
                             div { class: "lighting-label",
@@ -3412,7 +3741,7 @@ fn ControlDock(
                 } else {
                     div { class: if manual { "fan-panel manual" } else { "fan-panel" },
                         if fan_control_available {
-                            div { class: "mode-switch", "aria-label": text(language, MessageId::AppControlDock017),
+                            div { class: "mode-switch", style: "grid-template-columns: repeat({fan_mode_columns}, minmax(0, 1fr));", "aria-label": text(language, MessageId::AppControlDock017),
                                 for mode in supported_fan_modes {
                                     button {
                                         class: if mode == selected_fan_mode { "mode active" } else { "mode" },
@@ -3420,7 +3749,10 @@ fn ControlDock(
                                         disabled: !enabled,
                                         title: "{mode.hint(language)}",
                                         onclick: move |_| {
-                                            if mode == FanMode::Manual {
+                                            if mode == FanMode::Curve {
+                                                fan_editor_open.set(false);
+                                                curve_editor_open.set(true);
+                                            } else if mode == FanMode::Manual {
                                                 fan_editor_open.set(true);
                                             } else {
                                                 fan_editor_open.set(false);
@@ -3433,6 +3765,15 @@ fn ControlDock(
                             }
                         }
 
+                        if curve_editor_open() {
+                            CurveEditor {
+                                config: curve.as_ref().map(|s| s.config.clone()).unwrap_or_default(),
+                                fault: curve.as_ref().and_then(|s| s.fault.clone()),
+                                enabled,
+                                on_apply: move |config| { curve_editor_open.set(false); on_curve.call(config); },
+                                on_close: move |_| curve_editor_open.set(false),
+                            }
+                        }
                         if manual {
                             div { class: "manual-panel",
                                 FanSlider {
@@ -3461,6 +3802,17 @@ fn ControlDock(
                                     {text(language, MessageId::CommonApply)}
                                 }
                             }
+                        } else if fan_mode == FanMode::Curve {
+                            if let Some(status) = &curve {
+                                button {
+                                    class: "fan-mode-summary curve-status",
+                                    r#type: "button",
+                                    title: format!("Runs in the background and resumes after reboot. {}", status.fault.as_deref().unwrap_or("Click to edit curves")),
+                                    onclick: move |_| curve_editor_open.set(true),
+                                    span { class: if status.fault.is_some() { "curve-error" } else { "" }, "Auto Curve: {curve_state_label(&status.state)}" }
+                                    if let Some([cpu, gpu]) = status.requested { span { "CPU {cpu}% · GPU {gpu}%" } }
+                                }
+                            }
                         } else {
                             div {
                                 class: if selected_fan_mode == FanMode::Maximum {
@@ -3484,6 +3836,79 @@ fn ControlDock(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn emergency_draft(cpu: &str, gpu: &str) -> Result<EmergencyConfig, String> {
+    let config = EmergencyConfig {
+        schema: 1,
+        cpu_limit: cpu
+            .parse()
+            .map_err(|_| "Enter a CPU temperature (60–100°C)")?,
+        gpu_limit: gpu
+            .parse()
+            .map_err(|_| "Enter a GPU temperature (60–90°C)")?,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+#[component]
+fn EmergencyPanel(
+    status: Option<EmergencyStatus>,
+    enabled: bool,
+    on_apply: EventHandler<EmergencyConfig>,
+) -> Element {
+    let config = status
+        .as_ref()
+        .map(|s| s.config.clone())
+        .unwrap_or_default();
+    let initial = config.clone();
+    let mut cpu = use_signal(move || initial.cpu_limit.to_string());
+    let initial = config.clone();
+    let mut gpu = use_signal(move || initial.gpu_limit.to_string());
+    let mut observed = use_signal(|| config.clone());
+    if *observed.peek() != config {
+        observed.set(config.clone());
+        cpu.set(config.cpu_limit.to_string());
+        gpu.set(config.gpu_limit.to_string());
+    }
+    let draft = emergency_draft(&cpu(), &gpu());
+    let invalid = draft.as_ref().err().cloned();
+    let available = status.is_some();
+    rsx! {
+        div { class: "emergency-panel",
+            if let Some(status) = &status {
+                div { class: "emergency-readout",
+                    strong { "{curve_state_label(&status.state)}" }
+                    span { "Saved limits: CPU {status.config.cpu_limit}°C · GPU {status.config.gpu_limit}°C" }
+                    span { "CPU " {status.cpu_temperature.map_or_else(|| "Unavailable".into(), |t| format!("{t:.1}°C"))}
+                        " · GPU " {if status.gpu_sleeping { "Sleeping".into() } else { status.gpu_temperature.map_or_else(|| "Unavailable".into(), |t| format!("{t:.1}°C")) }} }
+                    small { {status.sample_age_seconds.map_or_else(|| "No sensor sample".into(), |age| if age <= 2 { "Fresh sample".into() } else { format!("Stale sample ({age}s old)") })} }
+                    if let Some(reason) = &status.reason { span { class: "curve-error", "{reason}" } }
+                    if status.state == "emergency" { span { "Recovery: {status.safe_samples}/5 fresh safe samples" } }
+                    if status.state == "firmware-managed" { small { "Firmware owns cooling; software emergency protection is inactive." } }
+                }
+            } else { p { "Emergency settings require an updated ASense daemon." } }
+            div { class: "emergency-inputs",
+                label { "CPU limit (°C)"
+                    input { r#type: "number", min: "60", max: "100", value: "{cpu}", disabled: !enabled || !available,
+                        oninput: move |event| cpu.set(event.value()) }
+                }
+                label { "GPU limit (°C)"
+                    input { r#type: "number", min: "60", max: "90", value: "{gpu}", disabled: !enabled || !available,
+                        oninput: move |event| gpu.set(event.value()) }
+                }
+            }
+            small { "Maximum cooling at either limit. Recovery needs five samples below each limit minus 5°C." }
+            if let Some(error) = invalid { p { class: "curve-error", "{error}" } }
+            div { class: "curve-actions",
+                button { r#type: "button", disabled: !enabled || !available,
+                    onclick: move |_| { let defaults = EmergencyConfig::default(); cpu.set(defaults.cpu_limit.to_string()); gpu.set(defaults.gpu_limit.to_string()); }, "Reset defaults" }
+                button { r#type: "button", disabled: !enabled || !available || draft.is_err(),
+                    onclick: move |_| { if let Ok(config) = emergency_draft(&cpu(), &gpu()) { on_apply.call(config); } }, "Apply" }
             }
         }
     }
@@ -4513,7 +4938,7 @@ fn FanGauge(
             }
             div { class: "gauge", style: "{style}",
                 div { class: "gauge-scale" }
-                div { class: "gauge-needle" }
+                if rpm.is_some() { div { class: "gauge-needle" } }
                 if let Some(secondary_needle) = secondary_needle {
                     div {
                         class: "gauge-needle",
@@ -4527,6 +4952,8 @@ fn FanGauge(
                     strong { "{rpm_value}" }
                     if let Some(secondary_rpm) = secondary_rpm {
                         span { "RPM · F3 {secondary_rpm}" }
+                    } else if rpm.is_none() {
+                        span { "RPM unavailable" }
                     } else {
                         span { "RPM" }
                     }
@@ -4951,6 +5378,123 @@ mod tests {
 
     fn production_source() -> &'static str {
         include_str!("app.rs").split("#[cfg(test)]").next().unwrap()
+    }
+
+    #[test]
+    fn emergency_editor_validates_temperature_ranges() {
+        assert_eq!(super::emergency_draft("100", "90").unwrap().cpu_limit, 100);
+        for (cpu, gpu) in [
+            ("", "84"),
+            ("101", "84"),
+            ("59", "84"),
+            ("92", "91"),
+            ("92", "bad"),
+        ] {
+            assert!(super::emergency_draft(cpu, gpu).is_err());
+        }
+    }
+
+    #[test]
+    fn daemon_curve_status_survives_manual_hardware_telemetry_and_explicit_mode_disables_it() {
+        let mut state = AppState::default();
+        let config = super::CurveConfig {
+            enabled: true,
+            ..super::CurveConfig::default()
+        };
+        let status = super::CurveStatus {
+            config,
+            state: "running".into(),
+            requested: Some([60, 50]),
+            fault: None,
+        };
+        apply_control_update(
+            &mut state,
+            ControlUpdate {
+                request: ControlRequest::background(ControlAction::CurvePoll),
+                result: Ok(ControlOutcome::Curve(Some(status))),
+            },
+        );
+        let mut sample = SystemTelemetry {
+            cpu_temperature_c: Some(65.0),
+            cpu_utilization_percent: Some(80.0),
+            memory_used_mib: 1024,
+            memory_total_mib: 2048,
+            gpu: GpuTelemetry::default(),
+            fans: FanState {
+                cpu: FanChannelState {
+                    mode: Some(HardwareFanMode::Manual),
+                    pwm_raw: 153,
+                    rpm: 4000,
+                },
+                gpu: FanChannelState {
+                    mode: Some(HardwareFanMode::Manual),
+                    pwm_raw: 128,
+                    rpm: 3000,
+                },
+            },
+            fan_rpm_channels: vec![
+                FanRpmChannel {
+                    index: 1,
+                    label: "CPU".into(),
+                    rpm: Some(4000),
+                },
+                FanRpmChannel {
+                    index: 2,
+                    label: "GPU".into(),
+                    rpm: Some(3000),
+                },
+            ],
+            profile_raw: None,
+            profile: None,
+            hardware: HardwareInfo::default(),
+            power_supply: PowerSupplyTelemetry::default(),
+        };
+        apply_telemetry(&mut state, sample.clone());
+        assert_eq!(state.fan_mode, FanMode::Curve);
+        assert_eq!(state.telemetry.cpu_fan_rpm, Some(4000));
+        sample.fan_rpm_channels[0].rpm = Some(5500);
+        sample.fan_rpm_channels[1].rpm = Some(4900);
+        apply_telemetry(&mut state, sample);
+        assert_eq!(state.telemetry.cpu_fan_rpm, Some(5500));
+        assert_eq!(state.telemetry.gpu_fan_rpm, Some(4900));
+        assert_eq!(state.fan_mode, FanMode::Curve);
+        apply_control_update(
+            &mut state,
+            ControlUpdate {
+                request: ControlRequest::foreground(ControlAction::FanMode(FanMode::Auto)),
+                result: Ok(ControlOutcome::FanMode(FanMode::Auto)),
+            },
+        );
+        assert_eq!(state.fan_mode, FanMode::Auto);
+        assert!(!state.curve.unwrap().config.enabled);
+    }
+
+    #[test]
+    fn background_curve_poll_does_not_block_user_actions_or_complete_them_early() {
+        let mut state = AppState::default();
+        let poll = ControlRequest::background(ControlAction::CurvePoll);
+        assert!(begin_control_request(&mut state, poll.clone()));
+        assert!(state.curve_polling);
+        let foreground = ControlRequest::foreground(ControlAction::FanMode(FanMode::Maximum));
+        assert!(begin_control_request(&mut state, foreground.clone()));
+        assert!(!state.curve_polling);
+        apply_control_update(
+            &mut state,
+            ControlUpdate {
+                request: poll,
+                result: Ok(ControlOutcome::Curve(None)),
+            },
+        );
+        assert!(state.control_busy);
+        assert_eq!(state.health, HealthState::Applying);
+        apply_control_update(
+            &mut state,
+            ControlUpdate {
+                request: foreground,
+                result: Ok(ControlOutcome::FanMode(FanMode::Maximum)),
+            },
+        );
+        assert!(!state.control_busy);
     }
 
     #[test]

@@ -11,6 +11,7 @@
 #include <linux/device.h>
 #include <linux/dmi.h>
 #include <linux/kernel.h>
+#include <linux/hwmon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
@@ -148,6 +149,7 @@ struct asense_zoned_quirk {
 };
 
 struct asense_rgb {
+	u16 supported_sensors;
 	struct wmi_device *wdev;
 	enum asense_endpoint_type endpoint_type;
 	/* Serializes firmware transactions and the resume cache. */
@@ -1728,7 +1730,10 @@ static ssize_t asense_fan_mode_store(struct device *dev, u16 fan_bitmap,
 	mutex_lock(&rgb->lock);
 	error = asense_read_fan_mode(rgb, fan_bitmap, &previous);
 	previous_valid = !error;
-	if (!error && previous == mode)
+	/* Re-send Auto so an explicit request restores firmware ownership even
+	 * when the getter already reports Auto. Keep other modes idempotent.
+	 */
+	if (!error && previous == mode && mode != ASENSE_FAN_MODE_AUTO)
 		goto out;
 	if (!error)
 		error = asense_write_fan_mode(rgb, fan_bitmap, mode);
@@ -2267,6 +2272,121 @@ static bool asense_reference_model(void)
 	return dmi_match(DMI_PRODUCT_NAME, "Predator PHN16-72");
 }
 
+/* Predator v4 sys-info selectors and units match the upstream acer-wmi
+ * hwmon ABI. Only these fixed, read-only sensors are exposed here. */
+#define ASENSE_SENSOR_STATUS_MASK GENMASK_ULL(7, 0)
+#define ASENSE_SENSOR_VALUE_MASK GENMASK_ULL(23, 8)
+#define ASENSE_SUPPORTED_SENSORS_MASK GENMASK_ULL(39, 24)
+static const u8 asense_temp_sensor_ids[] = { 0x01, 0x0a };
+static const u8 asense_fan_sensor_ids[] = { 0x02, 0x06 };
+
+static umode_t asense_hwmon_visible(const void *data,
+				    enum hwmon_sensor_types type, u32 attr,
+				    int channel)
+{
+	const struct asense_rgb *rgb = data;
+	u8 sensor;
+
+	if (channel < 0 || channel > 1)
+		return 0;
+	if (type == hwmon_temp &&
+	    (attr == hwmon_temp_input || attr == hwmon_temp_label))
+		sensor = asense_temp_sensor_ids[channel];
+	else if (type == hwmon_fan &&
+		 (attr == hwmon_fan_input || attr == hwmon_fan_label))
+		sensor = asense_fan_sensor_ids[channel];
+	else
+		return 0;
+	return rgb->supported_sensors & BIT(sensor - 1) ? 0444 : 0;
+}
+
+static int asense_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			     u32 attr, int channel, long *value)
+{
+	struct asense_rgb *rgb = dev_get_drvdata(dev);
+	u64 result, command;
+	u8 sensor;
+	int error;
+
+	if (channel < 0 || channel > 1)
+		return -EOPNOTSUPP;
+	if (type == hwmon_temp && attr == hwmon_temp_input)
+		sensor = asense_temp_sensor_ids[channel];
+	else if (type == hwmon_fan && attr == hwmon_fan_input)
+		sensor = asense_fan_sensor_ids[channel];
+	else
+		return -EOPNOTSUPP;
+	if (!(rgb->supported_sensors & BIT(sensor - 1)))
+		return -EOPNOTSUPP;
+	command = 0x01 | ((u64)sensor << 8);
+	mutex_lock(&rgb->lock);
+	error = asense_scalar_call(rgb, ASENSE_GAMING_SYS_INFO_GET,
+				   command, &result);
+	mutex_unlock(&rgb->lock);
+	if (error)
+		return error;
+	if (FIELD_GET(ASENSE_SENSOR_STATUS_MASK, result))
+		return -EIO;
+	*value = FIELD_GET(ASENSE_SENSOR_VALUE_MASK, result);
+	if (type == hwmon_temp) {
+		if (*value > 120)
+			return -ERANGE;
+		*value *= 1000;
+	}
+	return 0;
+}
+
+static int asense_hwmon_read_string(struct device *dev,
+				    enum hwmon_sensor_types type, u32 attr,
+				    int channel, const char **value)
+{
+	if (channel < 0 || channel > 1 ||
+	    !((type == hwmon_temp && attr == hwmon_temp_label) ||
+	      (type == hwmon_fan && attr == hwmon_fan_label)))
+		return -EOPNOTSUPP;
+	*value = channel ? "GPU" : "CPU";
+	return 0;
+}
+
+static const struct hwmon_ops asense_hwmon_ops = {
+	.is_visible = asense_hwmon_visible,
+	.read = asense_hwmon_read,
+	.read_string = asense_hwmon_read_string,
+};
+static const struct hwmon_channel_info *const asense_hwmon_channels[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL),
+	NULL,
+};
+static const struct hwmon_chip_info asense_hwmon_chip = {
+	.ops = &asense_hwmon_ops,
+	.info = asense_hwmon_channels,
+};
+static void asense_probe_hwmon(struct asense_rgb *rgb)
+{
+	struct device *hwmon;
+	u64 result;
+	int error;
+
+	mutex_lock(&rgb->lock);
+	error = asense_scalar_call(rgb, ASENSE_GAMING_SYS_INFO_GET,
+				   0, &result);
+	mutex_unlock(&rgb->lock);
+	if (error || FIELD_GET(ASENSE_SENSOR_STATUS_MASK, result))
+		return;
+	rgb->supported_sensors = FIELD_GET(ASENSE_SUPPORTED_SENSORS_MASK, result);
+	if (!(rgb->supported_sensors &
+	      (BIT(0) | BIT(1) | BIT(5) | BIT(9))))
+		return;
+	hwmon = devm_hwmon_device_register_with_info(&rgb->wdev->dev, "asense",
+						   rgb, &asense_hwmon_chip, NULL);
+	if (IS_ERR(hwmon))
+		dev_warn(&rgb->wdev->dev, "optional hwmon registration failed: %ld\n",
+			 PTR_ERR(hwmon));
+}
+
 static int asense_probe_gaming(struct asense_rgb *rgb)
 {
 	struct asense_effect effect;
@@ -2278,6 +2398,7 @@ static int asense_probe_gaming(struct asense_rgb *rgb)
 	bool enabled;
 	int error;
 
+	asense_probe_hwmon(rgb);
 	asense_select_zone_config(rgb);
 	error = asense_read_rgb_state(rgb, &effect, &zones);
 	if (!error) {
