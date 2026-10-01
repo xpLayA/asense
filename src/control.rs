@@ -206,11 +206,17 @@ impl ControlClient {
         status.config.validate().map_err(ControlError::Protocol)?;
         if status.state.len() > 32
             || status.reason.as_ref().is_some_and(|r| r.len() > 2048)
-            || status.safe_samples > 5
-            || [status.cpu_temperature, status.gpu_temperature]
-                .into_iter()
-                .flatten()
-                .any(|t| !t.is_finite() || !(0.0..=120.0).contains(&t))
+            || status.pending_seconds > 600
+            || status.release_seconds_elapsed > 600
+            || [
+                status.cpu_temperature,
+                status.gpu_temperature,
+                status.cpu_filtered,
+                status.gpu_filtered,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|t| !t.is_finite() || !(0.0..=120.0).contains(&t))
         {
             return Err(ControlError::Protocol(
                 "invalid emergency status fields".into(),
@@ -224,8 +230,8 @@ impl ControlClient {
     ) -> ControlResult<crate::fan_curve::EmergencyStatus> {
         config.validate().map_err(ControlError::InvalidRequest)?;
         self.request(&format!(
-            "FAN EMERGENCY SET {} {}",
-            config.cpu_limit, config.gpu_limit
+            "FAN EMERGENCY SET {} {} {} {}",
+            config.cpu_limit, config.gpu_limit, config.trigger_seconds, config.release_seconds
         ))?;
         self.emergency()
     }
@@ -883,6 +889,7 @@ mod tests {
             schema: 1,
             cpu_limit: 100,
             gpu_limit: 90,
+            ..Default::default()
         };
         let expected = crate::fan_curve::EmergencyStatus {
             config: config.clone(),
@@ -892,14 +899,17 @@ mod tests {
             gpu_sleeping: false,
             sample_age_seconds: Some(0),
             reason: None,
-            safe_samples: 0,
+            cpu_filtered: Some(70.0),
+            gpu_filtered: Some(55.0),
+            pending_seconds: 0,
+            release_seconds_elapsed: 0,
         };
         let reply = format!("OK {}\n", serde_json::to_string(&expected).unwrap());
         let server = std::thread::spawn(move || {
             let mut reader = BufReader::new(server_stream.try_clone().unwrap());
             let mut command = String::new();
             reader.read_line(&mut command).unwrap();
-            assert_eq!(command, "FAN EMERGENCY SET 100 90\n");
+            assert_eq!(command, "FAN EMERGENCY SET 100 90 60 60\n");
             assert!(command.len() <= super::MAX_CONTROL_COMMAND_BYTES);
             server_stream
                 .write_all(b"OK emergency=settings-saved\n")
@@ -960,7 +970,14 @@ mod tests {
                 gpu_sleeping: false,
                 sample_age_seconds: Some(0),
                 reason: None,
-                safe_samples: 6,
+                pending_seconds: 601,
+                ..crate::fan_curve::EmergencyStatus::snapshot(
+                    Default::default(),
+                    String::new(),
+                    None,
+                    None,
+                    &Default::default(),
+                )
             };
             server_stream
                 .write_all(format!("OK {}\n", serde_json::to_string(&status).unwrap()).as_bytes())

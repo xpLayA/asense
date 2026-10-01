@@ -378,9 +378,79 @@ fn workspace_aspect_ratio(advanced: bool) -> f64 {
     design_width(advanced) / WORKSPACE_DESIGN_HEIGHT
 }
 
-fn logical_window_size(advanced: bool, height: f64) -> LogicalSize<f64> {
+/// Who draws the window frame. Tiling compositors place, size and close
+/// windows themselves, so the custom titlebar and aspect lock only get in the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromeMode {
+    Custom,
+    Compositor,
+}
+
+const TILING_COMPOSITOR_SOCKETS: [&str; 4] = [
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
+    "NIRI_SOCKET",
+    "I3SOCK",
+];
+const TILING_DESKTOPS: [&str; 11] = [
+    "hyprland",
+    "sway",
+    "niri",
+    "river",
+    "i3",
+    "qtile",
+    "dwl",
+    "bspwm",
+    "xmonad",
+    "herbstluftwm",
+    "awesome",
+];
+/// Tiles can be small; the stage scales to whatever the compositor assigns.
+const COMPOSITOR_MIN_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(360.0, 320.0);
+
+/// `ASENSE_TITLEBAR=show|hide` overrides detection of tiling compositors.
+fn chrome_mode_from(get: impl Fn(&str) -> Option<String>) -> ChromeMode {
+    match get("ASENSE_TITLEBAR")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("show") => return ChromeMode::Custom,
+        Some("hide") => return ChromeMode::Compositor,
+        _ => {}
+    }
+    let socket = TILING_COMPOSITOR_SOCKETS
+        .iter()
+        .any(|name| get(name).is_some_and(|value| !value.trim().is_empty()));
+    let desktop = ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(&get)
+        .any(|value| {
+            value
+                .split(':')
+                .any(|name| TILING_DESKTOPS.contains(&name.trim().to_ascii_lowercase().as_str()))
+        });
+    if socket || desktop {
+        ChromeMode::Compositor
+    } else {
+        ChromeMode::Custom
+    }
+}
+
+fn chrome_mode() -> ChromeMode {
+    static MODE: std::sync::OnceLock<ChromeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| chrome_mode_from(|name| std::env::var(name).ok()))
+}
+
+fn titlebar_height() -> f64 {
+    match chrome_mode() {
+        ChromeMode::Custom => TITLEBAR_DESIGN_HEIGHT,
+        ChromeMode::Compositor => 0.0,
+    }
+}
+
+fn logical_window_size(advanced: bool, height: f64, titlebar: f64) -> LogicalSize<f64> {
     let height = height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT);
-    let workspace_height = (height - TITLEBAR_DESIGN_HEIGHT).max(1.0);
+    let workspace_height = (height - titlebar).max(1.0);
     LogicalSize::new(workspace_height * workspace_aspect_ratio(advanced), height)
 }
 
@@ -394,6 +464,7 @@ fn aspect_constrained_size(
     advanced: bool,
     scale_factor: f64,
     direction: Option<ResizeDirection>,
+    titlebar: f64,
 ) -> PhysicalSize<u32> {
     let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
         scale_factor
@@ -401,7 +472,7 @@ fn aspect_constrained_size(
         1.0
     };
     let ratio = workspace_aspect_ratio(advanced);
-    let titlebar_height = TITLEBAR_DESIGN_HEIGHT * scale_factor;
+    let titlebar_height = titlebar * scale_factor;
     let minimum_height = MIN_WINDOW_HEIGHT * scale_factor;
     let maximum_height = MAX_WINDOW_HEIGHT * scale_factor;
     let requested_width = f64::from(requested.width.max(1));
@@ -623,6 +694,7 @@ fn schedule_aspect_correction(
             advanced,
             window.scale_factor(),
             direction,
+            titlebar_height(),
         );
         let mut resize = state.borrow_mut();
         if physical_size_close(target, requested) {
@@ -667,7 +739,14 @@ fn set_window_mode(
     let current = window.inner_size();
     let logical_height =
         (f64::from(current.height) / scale_factor).clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT);
-    let logical_target = logical_window_size(advanced, logical_height);
+    let titlebar = titlebar_height();
+    let logical_target = logical_window_size(advanced, logical_height, titlebar);
+    if chrome_mode() == ChromeMode::Compositor {
+        // A floating window follows the mode; a tiled one keeps its tile.
+        state.borrow_mut().advanced = advanced;
+        window.set_inner_size(logical_target);
+        return;
+    }
     let physical_target = logical_target.to_physical::<u32>(scale_factor);
     let generation = {
         let mut resize = state.borrow_mut();
@@ -677,28 +756,40 @@ fn set_window_mode(
         resize.direction = None;
         resize.begin_pending_correction(physical_target, true)
     };
-    window.set_min_inner_size(Some(logical_window_size(advanced, MIN_WINDOW_HEIGHT)));
-    window.set_max_inner_size(Some(logical_window_size(advanced, MAX_WINDOW_HEIGHT)));
+    window.set_min_inner_size(Some(logical_window_size(
+        advanced,
+        MIN_WINDOW_HEIGHT,
+        titlebar,
+    )));
+    window.set_max_inner_size(Some(logical_window_size(
+        advanced,
+        MAX_WINDOW_HEIGHT,
+        titlebar,
+    )));
     schedule_pending_correction_timeout(window, state, generation);
     window.set_inner_size(logical_target);
 }
 
 pub fn launch() {
+    let titlebar = titlebar_height();
+    let window = WindowBuilder::new()
+        .with_title("ASense")
+        .with_decorations(false)
+        .with_transparent(false)
+        .with_inner_size(logical_window_size(false, INITIAL_WINDOW_HEIGHT, titlebar))
+        .with_resizable(true)
+        .with_maximizable(false);
+    let window = match chrome_mode() {
+        ChromeMode::Custom => window
+            .with_min_inner_size(logical_window_size(false, MIN_WINDOW_HEIGHT, titlebar))
+            .with_max_inner_size(logical_window_size(false, MAX_WINDOW_HEIGHT, titlebar)),
+        ChromeMode::Compositor => window.with_min_inner_size(COMPOSITOR_MIN_WINDOW_SIZE),
+    };
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
             Config::new()
                 .with_background_color((8, 9, 16, 255))
-                .with_window(
-                    WindowBuilder::new()
-                        .with_title("ASense")
-                        .with_decorations(false)
-                        .with_transparent(false)
-                        .with_inner_size(logical_window_size(false, INITIAL_WINDOW_HEIGHT))
-                        .with_min_inner_size(logical_window_size(false, MIN_WINDOW_HEIGHT))
-                        .with_max_inner_size(logical_window_size(false, MAX_WINDOW_HEIGHT))
-                        .with_resizable(true)
-                        .with_maximizable(false),
-                )
+                .with_window(window)
                 .with_menu(None),
         )
         .launch(Root);
@@ -1078,12 +1169,14 @@ fn Root() -> Element {
     let resize_state = aspect_state.clone();
     let telemetry_resume = use_hook(|| Arc::new(AtomicBool::new(false)));
     let resume_signal = telemetry_resume.clone();
+    // The compositor owns the size of a tiled window: never correct it.
+    let compositor_frame = chrome_mode() == ChromeMode::Compositor;
     let _aspect_handler = use_wry_event_handler(move |event, _target| match event {
         TaoEvent::WindowEvent {
             window_id,
             event: WindowEvent::Resized(size),
             ..
-        } if *window_id == resize_window.id() => {
+        } if !compositor_frame && *window_id == resize_window.id() => {
             queue_aspect_resize(&resize_window, &resize_state, *size);
         }
         TaoEvent::WindowEvent {
@@ -1095,14 +1188,14 @@ fn Root() -> Element {
                     ..
                 },
             ..
-        } if *window_id == resize_window.id() => {
+        } if !compositor_frame && *window_id == resize_window.id() => {
             finish_aspect_resize(&resize_window, &resize_state);
         }
         TaoEvent::WindowEvent {
             window_id,
             event: WindowEvent::Focused(false),
             ..
-        } if *window_id == resize_window.id() => {
+        } if !compositor_frame && *window_id == resize_window.id() => {
             finish_aspect_resize(&resize_window, &resize_state);
         }
         TaoEvent::Resumed => resume_signal.store(true, Ordering::Release),
@@ -1312,8 +1405,10 @@ fn Root() -> Element {
     rsx! {
         document::Title { "ASense" }
         style { "{APP_CSS}" }
-        div { class: "app-window",
-                    WindowChrome { language: language() }
+        div { class: if compositor_frame { "app-window compositor" } else { "app-window" },
+            if !compositor_frame {
+                WindowChrome { language: language() }
+            }
             div {
                 class: if advanced_open() { "window-workspace advanced" } else { "window-workspace" },
                 div { class: "design-stage",
@@ -1358,11 +1453,13 @@ fn Root() -> Element {
                     }
                 }
             }
-            ResizeHandles {
-                on_resize_start: move |direction| {
-                    let mut resize = handle_aspect_state.borrow_mut();
-                    resize.accepted = handle_window.inner_size();
-                    resize.direction = Some(direction);
+            if !compositor_frame {
+                ResizeHandles {
+                    on_resize_start: move |direction| {
+                        let mut resize = handle_aspect_state.borrow_mut();
+                        resize.accepted = handle_window.inner_size();
+                        resize.direction = Some(direction);
+                    }
                 }
             }
         }
@@ -2064,6 +2161,7 @@ fn curve_state_label(state: &str) -> &str {
         "sensor-fault" => "Sensor fault — cooling fallback",
         "control-fault" => "Fan control fault",
         "emergency" => "Thermal emergency",
+        "emergency-pending" => "Hot — emergency pending",
         "starting" => "Starting",
         "paused" => "Paused",
         "unavailable" => "Hardware unavailable",
@@ -3298,6 +3396,7 @@ fn ControlDock(
     }
 
     let mut curve_editor_open = use_signal(|| false);
+    let mut emergency_editor_open = use_signal(|| false);
     let mut cpu_draft = use_signal(move || cpu_fan_percent);
     let mut gpu_draft = use_signal(move || gpu_fan_percent);
     let initial_manual = fan_mode == FanMode::Manual;
@@ -3471,6 +3570,13 @@ fn ControlDock(
                 style: "grid-template-columns:repeat({profile_count},minmax(0,1fr))",
                 title: profile_source_hint,
                 "aria-label": text(language, MessageId::AppControlDock009),
+                if profile_choices.is_empty() {
+                    // Keep the fixed row filled rather than leaving a blank band.
+                    div { class: "profile-unavailable",
+                        span { {text(language, MessageId::AppQuickStrip002)} }
+                        {text(language, MessageId::CommonUnavailable)}
+                    }
+                }
                 for choice in profile_choices {
                     button {
                         class: if selected_profile_raw == choice.raw { "profile active" } else { "profile" },
@@ -3544,7 +3650,19 @@ fn ControlDock(
 
             div { class: "dock-content",
                 if dock_tab() == DockTab::Emergency {
-                    EmergencyPanel { status: emergency.clone(), enabled, on_apply: on_emergency }
+                    EmergencySummary {
+                        status: emergency.clone(),
+                        enabled: enabled && emergency.is_some(),
+                        on_edit: move |_| emergency_editor_open.set(true),
+                    }
+                    if emergency_editor_open() && let Some(status) = emergency.clone() {
+                        EmergencyEditor {
+                            status,
+                            enabled,
+                            on_apply: move |config| { emergency_editor_open.set(false); on_emergency.call(config); },
+                            on_close: move |_| emergency_editor_open.set(false),
+                        }
+                    }
                 } else if dock_tab() == DockTab::Keyboard {
                     div { class: "keyboard-panel",
                         div { class: "lighting-power", "aria-label": text(language, MessageId::AppControlDock013),
@@ -3844,7 +3962,12 @@ fn ControlDock(
     }
 }
 
-fn emergency_draft(cpu: &str, gpu: &str) -> Result<EmergencyConfig, String> {
+fn emergency_draft(
+    cpu: &str,
+    gpu: &str,
+    trigger: &str,
+    release: &str,
+) -> Result<EmergencyConfig, String> {
     let config = EmergencyConfig {
         schema: 1,
         cpu_limit: cpu
@@ -3853,65 +3976,159 @@ fn emergency_draft(cpu: &str, gpu: &str) -> Result<EmergencyConfig, String> {
         gpu_limit: gpu
             .parse()
             .map_err(|_| "Enter a GPU temperature (60–90°C)")?,
+        trigger_seconds: trigger
+            .parse()
+            .map_err(|_| "Enter a trigger delay (10–300 s)")?,
+        release_seconds: release
+            .parse()
+            .map_err(|_| "Enter a release delay (10–600 s)")?,
     };
     config.validate()?;
     Ok(config)
 }
 
+fn temperature_text(raw: Option<f32>, filtered: Option<f32>, sleeping: bool) -> String {
+    if sleeping {
+        return "Sleeping".into();
+    }
+    match (raw, filtered) {
+        (Some(raw), Some(filtered)) => format!("{raw:.1}°C (filtered {filtered:.1}°C)"),
+        (Some(raw), None) => format!("{raw:.1}°C"),
+        _ => "Unavailable".into(),
+    }
+}
+
+fn emergency_progress(status: &EmergencyStatus) -> Option<String> {
+    match status.state.as_str() {
+        "emergency-pending" => Some(format!(
+            "Pending {}/{} s at limit",
+            status.pending_seconds, status.config.trigger_seconds
+        )),
+        "emergency" => Some(format!(
+            "Recovery {}/{} s below limit − 5°C",
+            status.release_seconds_elapsed, status.config.release_seconds
+        )),
+        _ => None,
+    }
+}
+
+/// Fits the dock's two 40 px rows like the Fans tab; editing opens a popup.
 #[component]
-fn EmergencyPanel(
+fn EmergencySummary(
     status: Option<EmergencyStatus>,
     enabled: bool,
-    on_apply: EventHandler<EmergencyConfig>,
+    on_edit: EventHandler<()>,
 ) -> Element {
-    let config = status
-        .as_ref()
-        .map(|s| s.config.clone())
-        .unwrap_or_default();
+    let Some(status) = status else {
+        return rsx! {
+            div { class: "fan-panel",
+                div { class: "fan-mode-summary", strong { "Emergency settings require an updated ASense daemon." } }
+            }
+        };
+    };
+    let hot = matches!(status.state.as_str(), "emergency" | "emergency-pending");
+    let detail = if status.state == "firmware-managed" {
+        "Firmware owns cooling; software protection inactive".to_string()
+    } else {
+        emergency_progress(&status).unwrap_or_else(|| {
+            format!(
+                "CPU {} · GPU {}",
+                temperature_text(status.cpu_temperature, None, false),
+                temperature_text(status.gpu_temperature, None, status.gpu_sleeping)
+            )
+        })
+    };
+    let config = &status.config;
+    rsx! {
+        div { class: "fan-panel",
+            div { class: if hot { "fan-mode-summary maximum" } else { "fan-mode-summary" },
+                title: status.reason.clone().unwrap_or_default(),
+                span { class: "fan-summary-dot" }
+                strong { "{curve_state_label(&status.state)}" }
+                span { class: if status.reason.is_some() && hot { "curve-error" } else { "" }, "{detail}" }
+            }
+            button { class: "fan-mode-summary emergency-edit", r#type: "button", disabled: !enabled,
+                title: "Edit emergency limits and delays",
+                onclick: move |_| on_edit.call(()),
+                span { "CPU {config.cpu_limit}°C · GPU {config.gpu_limit}°C · trigger {config.trigger_seconds} s · release {config.release_seconds} s" }
+                strong { "Edit" }
+            }
+        }
+    }
+}
+
+#[component]
+fn EmergencyEditor(
+    status: EmergencyStatus,
+    enabled: bool,
+    on_apply: EventHandler<EmergencyConfig>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let config = status.config.clone();
     let initial = config.clone();
     let mut cpu = use_signal(move || initial.cpu_limit.to_string());
     let initial = config.clone();
     let mut gpu = use_signal(move || initial.gpu_limit.to_string());
+    let initial = config.clone();
+    let mut trigger = use_signal(move || initial.trigger_seconds.to_string());
+    let initial = config.clone();
+    let mut release = use_signal(move || initial.release_seconds.to_string());
     let mut observed = use_signal(|| config.clone());
     if *observed.peek() != config {
         observed.set(config.clone());
         cpu.set(config.cpu_limit.to_string());
         gpu.set(config.gpu_limit.to_string());
+        trigger.set(config.trigger_seconds.to_string());
+        release.set(config.release_seconds.to_string());
     }
-    let draft = emergency_draft(&cpu(), &gpu());
+    let draft = emergency_draft(&cpu(), &gpu(), &trigger(), &release());
     let invalid = draft.as_ref().err().cloned();
-    let available = status.is_some();
     rsx! {
-        div { class: "emergency-panel",
-            if let Some(status) = &status {
+        div { class: "curve-overlay",
+            div { class: "curve-dialog emergency-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Edit emergency protection",
+                h2 { "Emergency" }
                 div { class: "emergency-readout",
                     strong { "{curve_state_label(&status.state)}" }
-                    span { "Saved limits: CPU {status.config.cpu_limit}°C · GPU {status.config.gpu_limit}°C" }
-                    span { "CPU " {status.cpu_temperature.map_or_else(|| "Unavailable".into(), |t| format!("{t:.1}°C"))}
-                        " · GPU " {if status.gpu_sleeping { "Sleeping".into() } else { status.gpu_temperature.map_or_else(|| "Unavailable".into(), |t| format!("{t:.1}°C")) }} }
+                    span { "CPU " {temperature_text(status.cpu_temperature, status.cpu_filtered, false)}
+                        " · GPU " {temperature_text(status.gpu_temperature, status.gpu_filtered, status.gpu_sleeping)} }
                     small { {status.sample_age_seconds.map_or_else(|| "No sensor sample".into(), |age| if age <= 2 { "Fresh sample".into() } else { format!("Stale sample ({age}s old)") })} }
                     if let Some(reason) = &status.reason { span { class: "curve-error", "{reason}" } }
-                    if status.state == "emergency" { span { "Recovery: {status.safe_samples}/5 fresh safe samples" } }
+                    if let Some(progress) = emergency_progress(&status) { span { "{progress}" } }
                     if status.state == "firmware-managed" { small { "Firmware owns cooling; software emergency protection is inactive." } }
                 }
-            } else { p { "Emergency settings require an updated ASense daemon." } }
-            div { class: "emergency-inputs",
-                label { "CPU limit (°C)"
-                    input { r#type: "number", min: "60", max: "100", value: "{cpu}", disabled: !enabled || !available,
-                        oninput: move |event| cpu.set(event.value()) }
+                div { class: "emergency-inputs",
+                    label { "CPU limit (°C)"
+                        input { r#type: "number", min: "60", max: "100", value: "{cpu}", disabled: !enabled,
+                            oninput: move |event| cpu.set(event.value()) }
+                    }
+                    label { "GPU limit (°C)"
+                        input { r#type: "number", min: "60", max: "90", value: "{gpu}", disabled: !enabled,
+                            oninput: move |event| gpu.set(event.value()) }
+                    }
+                    label { "Trigger delay (s)"
+                        input { r#type: "number", min: "10", max: "300", value: "{trigger}", disabled: !enabled,
+                            oninput: move |event| trigger.set(event.value()) }
+                    }
+                    label { "Release delay (s)"
+                        input { r#type: "number", min: "10", max: "600", value: "{release}", disabled: !enabled,
+                            oninput: move |event| release.set(event.value()) }
+                    }
                 }
-                label { "GPU limit (°C)"
-                    input { r#type: "number", min: "60", max: "90", value: "{gpu}", disabled: !enabled || !available,
-                        oninput: move |event| gpu.set(event.value()) }
+                p { "Short temperature spikes are filtered out. Maximum cooling starts after the filtered temperature stays at a limit for the trigger delay (10 s at limit + 5°C). It is released after the release delay below each limit − 5°C." }
+                if let Some(error) = invalid { p { class: "curve-error", "{error}" } }
+                div { class: "curve-actions",
+                    button { r#type: "button", disabled: !enabled,
+                        onclick: move |_| {
+                            let defaults = EmergencyConfig::default();
+                            cpu.set(defaults.cpu_limit.to_string());
+                            gpu.set(defaults.gpu_limit.to_string());
+                            trigger.set(defaults.trigger_seconds.to_string());
+                            release.set(defaults.release_seconds.to_string());
+                        }, "Reset defaults" }
+                    button { r#type: "button", onclick: move |_| on_close.call(()), "Cancel" }
+                    button { class: "apply-button", r#type: "button", disabled: !enabled || draft.is_err(),
+                        onclick: move |_| { if let Ok(config) = emergency_draft(&cpu(), &gpu(), &trigger(), &release()) { on_apply.call(config); } }, "Apply" }
                 }
-            }
-            small { "Maximum cooling at either limit. Recovery needs five samples below each limit minus 5°C." }
-            if let Some(error) = invalid { p { class: "curve-error", "{error}" } }
-            div { class: "curve-actions",
-                button { r#type: "button", disabled: !enabled || !available,
-                    onclick: move |_| { let defaults = EmergencyConfig::default(); cpu.set(defaults.cpu_limit.to_string()); gpu.set(defaults.gpu_limit.to_string()); }, "Reset defaults" }
-                button { r#type: "button", disabled: !enabled || !available || draft.is_err(),
-                    onclick: move |_| { if let Ok(config) = emergency_draft(&cpu(), &gpu()) { on_apply.call(config); } }, "Apply" }
             }
         }
     }
@@ -5384,16 +5601,29 @@ mod tests {
     }
 
     #[test]
-    fn emergency_editor_validates_temperature_ranges() {
-        assert_eq!(super::emergency_draft("100", "90").unwrap().cpu_limit, 100);
-        for (cpu, gpu) in [
-            ("", "84"),
-            ("101", "84"),
-            ("59", "84"),
-            ("92", "91"),
-            ("92", "bad"),
+    fn emergency_editor_validates_temperature_ranges_and_delays() {
+        let config = super::emergency_draft("100", "90", "60", "120").unwrap();
+        assert_eq!(
+            (
+                config.cpu_limit,
+                config.trigger_seconds,
+                config.release_seconds
+            ),
+            (100, 60, 120)
+        );
+        for (cpu, gpu, trigger, release) in [
+            ("", "84", "60", "60"),
+            ("101", "84", "60", "60"),
+            ("59", "84", "60", "60"),
+            ("92", "91", "60", "60"),
+            ("92", "bad", "60", "60"),
+            ("92", "84", "9", "60"),
+            ("92", "84", "301", "60"),
+            ("92", "84", "60", "9"),
+            ("92", "84", "60", "601"),
+            ("92", "84", "", "60"),
         ] {
-            assert!(super::emergency_draft(cpu, gpu).is_err());
+            assert!(super::emergency_draft(cpu, gpu, trigger, release).is_err());
         }
     }
 
@@ -6710,10 +6940,90 @@ mod tests {
     }
 
     #[test]
+    fn tiling_compositors_hide_the_custom_titlebar_unless_overridden() {
+        let mode = |pairs: &[(&str, &str)]| {
+            super::chrome_mode_from(|name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+        use super::ChromeMode::{Compositor, Custom};
+        for socket in [
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "SWAYSOCK",
+            "NIRI_SOCKET",
+            "I3SOCK",
+        ] {
+            assert_eq!(mode(&[(socket, "x")]), Compositor, "{socket}");
+            assert_eq!(mode(&[(socket, " ")]), Custom, "{socket}");
+        }
+        assert_eq!(mode(&[("XDG_CURRENT_DESKTOP", "sway:wlroots")]), Compositor);
+        assert_eq!(mode(&[("XDG_SESSION_DESKTOP", "Hyprland")]), Compositor);
+        assert_eq!(mode(&[("XDG_CURRENT_DESKTOP", "KDE")]), Custom);
+        assert_eq!(mode(&[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")]), Custom);
+        assert_eq!(mode(&[]), Custom);
+        let hyprland = ("HYPRLAND_INSTANCE_SIGNATURE", "x");
+        assert_eq!(mode(&[hyprland, ("ASENSE_TITLEBAR", "Show")]), Custom);
+        assert_eq!(
+            mode(&[("XDG_CURRENT_DESKTOP", "KDE"), ("ASENSE_TITLEBAR", "hide")]),
+            Compositor
+        );
+        assert_eq!(mode(&[hyprland, ("ASENSE_TITLEBAR", "maybe")]), Compositor);
+    }
+
+    #[test]
+    fn compositor_frame_gives_the_whole_window_to_the_workspace() {
+        for advanced in [false, true] {
+            let size = logical_window_size(advanced, 830.0, 0.0);
+            assert!((size.width / size.height - workspace_aspect_ratio(advanced)).abs() < 1e-12);
+            let accepted = size.to_physical::<u32>(1.0);
+            let request = PhysicalSize::new(accepted.width + 100, accepted.height);
+            let projected = aspect_constrained_size(
+                request,
+                accepted,
+                advanced,
+                1.0,
+                Some(ResizeDirection::East),
+                0.0,
+            );
+            assert!(
+                (f64::from(projected.width) / f64::from(projected.height)
+                    - workspace_aspect_ratio(advanced))
+                .abs()
+                    < 0.002
+            );
+        }
+        let frame = css_rule(".app-window.compositor {");
+        assert!(frame.contains("grid-template-rows: minmax(0, 1fr)"));
+        assert!(frame.contains("border-radius: 0"));
+        let production = production_source();
+        assert!(production.contains("if !compositor_frame {\n                WindowChrome"));
+        assert!(production.contains("!compositor_frame && *window_id"));
+    }
+
+    #[test]
+    fn editor_overlays_cover_only_the_visible_composition() {
+        let overlay = css_rule(".curve-overlay {");
+        assert!(overlay.contains("width: 620px"));
+        assert!(overlay.contains("height: 650px"));
+        assert!(!overlay.contains("inset: 0"));
+        assert!(css_rule(".asense-shell.advanced .curve-overlay {").contains("width: 1200px"));
+        assert!(css_rule(".curve-dialog {").contains("max-height: 100%"));
+        assert!(css_rule(".curve-dialog .curve-actions {").contains("position: sticky"));
+        let production = production_source();
+        assert!(production.contains("EmergencySummary {"));
+        assert!(production.contains("EmergencyEditor {"));
+        assert!(!production.contains("EmergencyPanel"));
+        assert!(production.contains("profile-unavailable"));
+    }
+
+    #[test]
     fn compact_and_advanced_endpoints_preserve_fixed_titlebar_and_workspace_scale() {
         let height = 830.0;
-        let compact = logical_window_size(false, height);
-        let advanced = logical_window_size(true, height);
+        let compact = logical_window_size(false, height, TITLEBAR_DESIGN_HEIGHT);
+        let advanced = logical_window_size(true, height, TITLEBAR_DESIGN_HEIGHT);
         let workspace_height = height - TITLEBAR_DESIGN_HEIGHT;
 
         assert_eq!(compact.height, height);
@@ -6732,7 +7042,7 @@ mod tests {
 
     #[test]
     fn native_endpoint_sizes_are_clamped_with_a_fixed_titlebar() {
-        let tiny = logical_window_size(false, 30.0);
+        let tiny = logical_window_size(false, 30.0, TITLEBAR_DESIGN_HEIGHT);
         assert_eq!(tiny.height, MIN_WINDOW_HEIGHT);
         assert_eq!(
             tiny.width,
@@ -6743,7 +7053,8 @@ mod tests {
     #[test]
     fn resize_projection_is_affine_idempotent_and_accounts_for_titlebar() {
         for advanced in [false, true] {
-            let accepted = logical_window_size(advanced, 830.0).to_physical::<u32>(1.0);
+            let accepted = logical_window_size(advanced, 830.0, TITLEBAR_DESIGN_HEIGHT)
+                .to_physical::<u32>(1.0);
             let horizontal_request = PhysicalSize::new(accepted.width + 137, accepted.height);
             let horizontal = aspect_constrained_size(
                 horizontal_request,
@@ -6751,6 +7062,7 @@ mod tests {
                 advanced,
                 1.0,
                 Some(ResizeDirection::East),
+                TITLEBAR_DESIGN_HEIGHT,
             );
             let vertical_request = PhysicalSize::new(accepted.width, accepted.height + 91);
             let vertical = aspect_constrained_size(
@@ -6759,6 +7071,7 @@ mod tests {
                 advanced,
                 1.0,
                 Some(ResizeDirection::South),
+                TITLEBAR_DESIGN_HEIGHT,
             );
 
             for projected in [horizontal, vertical] {
@@ -6769,7 +7082,14 @@ mod tests {
                     .abs()
                         < 0.002
                 );
-                let repeated = aspect_constrained_size(projected, projected, advanced, 1.0, None);
+                let repeated = aspect_constrained_size(
+                    projected,
+                    projected,
+                    advanced,
+                    1.0,
+                    None,
+                    TITLEBAR_DESIGN_HEIGHT,
+                );
                 assert!(physical_size_close(projected, repeated));
             }
         }

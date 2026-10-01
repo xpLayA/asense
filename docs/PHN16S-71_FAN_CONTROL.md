@@ -94,16 +94,17 @@ Curve settings are stored privately in `/var/lib/asense/fan-curve.json`.
 
 | State | Behavior |
 | --- | --- |
-| Thermal Emergency | A confirmed CPU or GPU reading at its saved limit requests Maximum. A valid hot reading still counts if the other sensor fails. |
+| Thermal Emergency | A spike-filtered CPU or GPU reading held at its saved limit for the trigger delay (default 60 s), or at limit + 5 °C for 10 s, requests Maximum. A valid hot reading still counts if the other sensor fails. See "Spike filtering and timed Emergency" below. |
 | Sensor hold | Missing required readings hold the last verified speeds for up to three seconds. |
 | Sensor fault | After the hold, apply at least 80% to both fans; higher demand from an available valid temperature wins. Without previous verified speeds, attempt the fallback immediately. |
 | Control fault | Report a failed fan write/readback separately from a temperature diagnosis. Attempt Maximum as a safety action; record new requested percentages only after confirmation. |
 
 Default Emergency limits are **92°C CPU / 84°C GPU**. The editor accepts
 **60–100°C CPU / 60–90°C GPU**, including higher limits selected during these
-sessions. Recovery requires five fresh, complete safe samples below each saved
-limit minus 5°C. Repeated cached samples do not advance recovery. Changing limits
-does not immediately clear an active emergency.
+sessions. Recovery requires fresh, complete readings below each saved limit
+minus 5°C for the whole release delay (default 60 s). Repeated cached samples do
+not advance recovery. Changing limits does not immediately clear an active
+emergency.
 
 Sensor-fault recovery requires five fresh complete valid samples. A positively
 identified sleeping GPU can be treated as sleeping rather than as a missing
@@ -134,8 +135,10 @@ The existing curve protocol remains unchanged. New commands are:
 
 ```text
 FAN EMERGENCY GET
-FAN EMERGENCY SET <cpu-limit> <gpu-limit>
+FAN EMERGENCY SET <cpu-limit> <gpu-limit> [<trigger-seconds> <release-seconds>]
 ```
+
+The two-argument form keeps the saved delays.
 
 Older daemons retain their existing controls and disable the unsupported
 Emergency editor gracefully.
@@ -498,3 +501,109 @@ The tests and build results above do not by themselves confirm that the pointer
 stutter is resolved. First use after installing suggests the stutter is fixed,
 but mouse or input lag can still appear. Until this is confirmed, switch to
 Maximum while gaming if lag appears.
+
+
+### Spike filtering and timed Emergency
+
+This section applies to the tested setup described at the top.
+
+#### Cause
+
+Fans sometimes ran at 90–100% with no load, and the CPU temperature looked
+normal by the time it was checked. This CPU is an Intel Core Ultra 9 275HX. Its
+`coretemp` "Package id 0" sensor jumps to 92–101 °C for 1–3 s when one core
+boosts, even at idle. A 40 s idle sample stayed at 53–54 °C. The service
+journal for 2026-09-30 and 2026-10-01 contains about 30 lines such as
+`CPU 99.0°C reached emergency limit 92°C`. A few seconds after each one, the
+curve already requested only 30–85%.
+
+The controller acted on every raw 1 Hz sample:
+
+- One spike to 85 °C or more raised the curve to 100% at once. Cooldown then
+  waited 15 s and dropped at most 20 points every 15 s, so one 1 s spike kept the
+  fans high for 45–60 s.
+- One sample at the limit started Emergency (Maximum). Five safe samples, about
+  5 s, released it. This caused short, repeated Maximum bursts, each with about
+  120 ms of firmware calls.
+
+#### Changes
+
+- **Spike filter (`ThermalFilter` in `src/fan_curve.rs`):**
+  - Each sensor keeps its last five raw samples. The filter takes their median,
+    then smooths it with an EMA (α = 0.4).
+  - The median ignores spikes of one or two samples. The EMA removes ±1–2 °C
+    idle jitter.
+  - A sustained step from 55 °C to 95 °C still gives 100% fan speed within
+    about 6 s.
+  - The window is seeded with the first reading after start or resume. It is
+    discarded after a gap of more than 3 s.
+  - Missing readings keep the existing sensor-hold and sensor-fault behavior.
+- **Auto Curve:**
+  - Curve targets, decrease hysteresis, and the existing ramp use the filtered
+    temperatures.
+  - While a filtered reading is at its limit and Emergency is not yet
+    confirmed, the state is `emergency-pending`. The curve requests Manual
+    100/100, so the delay never reduces cooling.
+- **Timed Emergency (`ThermalGuard`, shared by Auto Curve and the Manual
+  watchdog):**
+  - Maximum starts after the filtered reading stays at the limit for the
+    trigger delay (default 60 s, range 10–300 s).
+  - Dips of up to 3 °C below the limit pause the timer. Larger drops reset it.
+  - A filtered reading at limit + 5 °C or higher starts Maximum after 10 s
+    (fast trip).
+  - Release needs every filtered reading below its limit minus 5 °C, on
+    complete fresh samples, for the whole release delay (default 60 s, range
+    10–600 s). Any hot or incomplete sample restarts the countdown.
+  - In Manual mode, confirmed Maximum is re-checked every 5 s instead of being
+    rewritten every second.
+  - A single raw hot sample no longer rejects `FAN MANUAL` or curve
+    activation. They are rejected only while Emergency is active.
+- **Settings and GUI:**
+  - `fan-emergency.json` gains `trigger_seconds` and `release_seconds`. Older
+    files load with the 60 s defaults.
+  - The Emergency tab edits both delays and shows raw and filtered
+    temperatures. It also shows pending and recovery progress.
+
+#### What to look for in the journal
+
+```bash
+journalctl -u asense.service -f
+```
+
+- `asense CPU reading 99.0°C smoothed to 56.2°C (spike filter)`: a filtered
+  spike. This is logged at most once per minute.
+- `asense thermal emergency: CPU 93.4°C (filtered, raw 95.0°C) at or above 92°C for 60 s`:
+  Emergency started after sustained heat.
+- `asense thermal emergency released after 60 s below limit − 5°C`.
+
+#### Verify after installing
+
+1. Build and install: `./build.sh`, then `./install.sh target/release/asense`.
+2. At idle with Auto Curve, the fans stay at the curve's idle speed. The
+   journal may show spike-filter lines but no Emergency lines.
+3. Run `stress-ng --cpu 0 -t 120`. The fans should reach full speed within a
+   few seconds. Emergency starts only if the CPU stays at 92 °C or above for
+   60 s. After the load ends, it is released about 60 s after the temperature
+   drops below 87 °C.
+4. In the Emergency tab, change the delays, click **Apply**, and run
+   `sudo systemctl restart asense.service`. The new delays should still be
+   there.
+
+**Pending:** these changes have not yet been installed or verified on hardware.
+
+
+### GUI layout fixes
+
+Tested on the setup described at the top (Hyprland, Wayland, 1.6 scale).
+
+| Problem | Cause | Change |
+| --- | --- | --- |
+| Auto Curve editor was unusable unless Advanced was on. | The dashboard is a fixed 1200 × 650 px stage that is scaled with a CSS transform. A transformed element contains `position: fixed` children, so the popup was centered in the full 1200 px stage. Compact mode shows only the left 620 px, so half of the popup was cut off. | The popup is sized to the visible 620 px (1200 px in Advanced), like the help window. Long point lists scroll, and the action buttons stay visible at the bottom. |
+| Emergency tab did not match the other tabs and needed an inner scrollbar. | About 100 px of space held a full editor. | The tab now shows two rows like Fans: the state with countdown progress, and the saved limits with **Edit**. Editing opens a popup. |
+| A blank band appeared above the tabs. | This model exposes no performance profiles, so the profile row was empty. | The row now reads "Profile Unavailable". |
+| The top bar was useless on Hyprland, and resizing fought the compositor. | ASense draws its own title bar and keeps a fixed aspect ratio by resizing its window. Tiling compositors place and size windows themselves. | On tiling compositors (detected from `HYPRLAND_INSTANCE_SIGNATURE`, `SWAYSOCK`, `NIRI_SOCKET`, `I3SOCK` or `XDG_CURRENT_DESKTOP`), the bar, resize handles, aspect correction and size limit are off. The dashboard scales to fit the tile. `ASENSE_TITLEBAR=show` or `ASENSE_TITLEBAR=hide` overrides the detection. GNOME, KDE and other floating desktops are unchanged. |
+
+All four changes were verified with screenshots of the running GUI on Hyprland:
+compact mode, the Auto Curve popup, the Emergency tab and popup, Advanced
+mode, and the `ASENSE_TITLEBAR=show` override.
+

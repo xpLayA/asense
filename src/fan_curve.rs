@@ -1,4 +1,5 @@
 //! Shared curve configuration and daemon-owned cooling control.
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -177,12 +178,22 @@ fn save_settings(config: &impl Serialize, path: &Path) -> Result<(), String> {
 }
 
 pub const EMERGENCY_SETTINGS_PATH: &str = "/var/lib/asense/fan-emergency.json";
+const DEFAULT_EMERGENCY_DELAY_SECONDS: u16 = 60;
+const fn default_emergency_delay() -> u16 {
+    DEFAULT_EMERGENCY_DELAY_SECONDS
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmergencyConfig {
     pub schema: u8,
     pub cpu_limit: u8,
     pub gpu_limit: u8,
+    /// Seconds a filtered reading must stay at a limit before Maximum engages.
+    #[serde(default = "default_emergency_delay")]
+    pub trigger_seconds: u16,
+    /// Seconds every filtered reading must stay below its limit minus 5 °C.
+    #[serde(default = "default_emergency_delay")]
+    pub release_seconds: u16,
 }
 impl Default for EmergencyConfig {
     fn default() -> Self {
@@ -190,6 +201,8 @@ impl Default for EmergencyConfig {
             schema: 1,
             cpu_limit: 92,
             gpu_limit: 84,
+            trigger_seconds: DEFAULT_EMERGENCY_DELAY_SECONDS,
+            release_seconds: DEFAULT_EMERGENCY_DELAY_SECONDS,
         }
     }
 }
@@ -200,6 +213,11 @@ impl EmergencyConfig {
             || !(60..=90).contains(&self.gpu_limit)
         {
             return Err("emergency limits: CPU 60–100°C, GPU 60–90°C, schema 1 required".into());
+        }
+        if !(10..=300).contains(&self.trigger_seconds)
+            || !(10..=600).contains(&self.release_seconds)
+        {
+            return Err("emergency delays: trigger 10–300 s, release 10–600 s".into());
         }
         Ok(())
     }
@@ -224,11 +242,8 @@ impl EmergencyConfig {
         self.validate()?;
         save_settings(self, path)
     }
-    pub(crate) fn safe(&self, reading: &TemperatureReading) -> bool {
-        reading.complete().is_ok_and(|(cpu, gpu)| {
-            cpu < f32::from(self.cpu_limit - 5)
-                && gpu.is_none_or(|t| t < f32::from(self.gpu_limit - 5))
-        })
+    fn limits(&self) -> [f32; 2] {
+        [f32::from(self.cpu_limit), f32::from(self.gpu_limit)]
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -240,7 +255,17 @@ pub struct EmergencyStatus {
     pub gpu_sleeping: bool,
     pub sample_age_seconds: Option<u64>,
     pub reason: Option<String>,
-    pub safe_samples: u8,
+    /// Spike-filtered temperatures that Emergency and the curve act on.
+    #[serde(default)]
+    pub cpu_filtered: Option<f32>,
+    #[serde(default)]
+    pub gpu_filtered: Option<f32>,
+    /// Seconds credited toward the trigger delay.
+    #[serde(default)]
+    pub pending_seconds: u16,
+    /// Seconds credited toward the release delay while Emergency is active.
+    #[serde(default)]
+    pub release_seconds_elapsed: u16,
 }
 impl EmergencyStatus {
     pub(crate) fn snapshot(
@@ -248,7 +273,7 @@ impl EmergencyStatus {
         state: String,
         reading: Option<&TemperatureReading>,
         reason: Option<String>,
-        safe_samples: u8,
+        guard: &ThermalGuard,
     ) -> Self {
         Self {
             config,
@@ -260,7 +285,240 @@ impl EmergencyStatus {
                 .and_then(|r| r.sampled_at)
                 .map(|t| t.elapsed().as_secs()),
             reason,
-            safe_samples,
+            cpu_filtered: guard.filtered(0),
+            gpu_filtered: guard.filtered(1),
+            pending_seconds: if guard.active { 0 } else { seconds(guard.over) },
+            release_seconds_elapsed: if guard.active { seconds(guard.safe) } else { 0 },
+        }
+    }
+}
+fn seconds(duration: Duration) -> u16 {
+    duration.as_secs().min(u64::from(u16::MAX)) as u16
+}
+
+/// Raw 1 Hz samples kept per sensor for median spike rejection. A median of
+/// five ignores bursts of up to two samples, such as the 1–2 s package-
+/// temperature spikes of a single boosting core on hybrid Intel CPUs.
+const FILTER_WINDOW: usize = 5;
+/// EMA weight of each new median: about a 2 s time constant at 1 Hz, which
+/// smooths ±1–2 °C idle jitter while sustained load still arrives in seconds.
+const FILTER_ALPHA: f32 = 0.4;
+const FILTER_SETTLE_C: f32 = 0.5;
+/// Without a sample for this long, filter history no longer describes the
+/// present (suspend, pause, or a stalled tick) and is discarded.
+const FILTER_GAP_RESET: Duration = Duration::from_secs(3);
+/// Longest interval one sample can credit to a timer.
+const MAX_SAMPLE_CREDIT: Duration = Duration::from_secs(2);
+/// Filtered readings this far above a limit engage Emergency after
+/// `CRITICAL_DELAY` instead of the configured trigger delay.
+const CRITICAL_MARGIN_C: f32 = 5.0;
+const CRITICAL_DELAY: Duration = Duration::from_secs(10);
+/// Trigger timers hold within this margin below their threshold, so jitter
+/// around a limit cannot restart them, and reset once readings fall below it.
+const TRIGGER_HOLD_C: f32 = 3.0;
+/// Release requires every filtered reading below its limit minus this margin.
+const RELEASE_MARGIN_C: f32 = 5.0;
+/// Raw readings this far above the filtered value are logged, rate-limited.
+const SPIKE_LOG_C: f32 = 10.0;
+const SPIKE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const SENSOR_NAMES: [&str; 2] = ["CPU", "GPU"];
+
+/// Median-then-EMA filter for one temperature sensor.
+#[derive(Clone, Debug, Default)]
+struct ThermalFilter {
+    window: VecDeque<f32>,
+    value: Option<f32>,
+}
+impl ThermalFilter {
+    fn push(&mut self, raw: f32) -> f32 {
+        if self.window.is_empty() {
+            // Seed the whole window so spikes are rejected right after start or resume.
+            self.window.extend([raw; FILTER_WINDOW]);
+        } else {
+            self.window.pop_front();
+            self.window.push_back(raw);
+        }
+        let mut sorted: Vec<f32> = self.window.iter().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[FILTER_WINDOW / 2];
+        let value = self.value.map_or(median, |previous| {
+            let next = previous + FILTER_ALPHA * (median - previous);
+            // An EMA only approaches a constant input; settle so a reading held
+            // exactly at a limit is treated as reaching it.
+            if (median - next).abs() < FILTER_SETTLE_C {
+                median
+            } else {
+                next
+            }
+        });
+        self.value = Some(value);
+        value
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThermalState {
+    Normal,
+    /// A filtered reading is at (or recently near) a limit; the trigger delay runs.
+    Pending,
+    Emergency,
+}
+
+/// Spike-filtered, time-qualified thermal protection shared by Auto Curve and
+/// the Manual watchdog. Callers feed each fresh sample exactly once.
+#[derive(Debug, Default)]
+pub(crate) struct ThermalGuard {
+    filters: [ThermalFilter; 2],
+    filtered: [Option<f32>; 2],
+    over: Duration,
+    critical: Duration,
+    safe: Duration,
+    hot: bool,
+    active: bool,
+    reason: Option<String>,
+    last_sample: Option<Instant>,
+    last_spike_log: Option<Instant>,
+}
+impl ThermalGuard {
+    pub(crate) fn active(&self) -> bool {
+        self.active
+    }
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+    /// Filtered value of the latest valid sample of sensor 0 (CPU) or 1 (GPU).
+    pub(crate) fn filtered(&self, sensor: usize) -> Option<f32> {
+        self.filtered[sensor]
+    }
+    pub(crate) fn state(&self) -> ThermalState {
+        if self.active {
+            ThermalState::Emergency
+        } else if self.hot || !self.over.is_zero() {
+            ThermalState::Pending
+        } else {
+            ThermalState::Normal
+        }
+    }
+    /// New limits restart every countdown but never clear an active emergency.
+    pub(crate) fn reset_timers(&mut self) {
+        self.over = Duration::ZERO;
+        self.critical = Duration::ZERO;
+        self.safe = Duration::ZERO;
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        reading: &TemperatureReading,
+        limits: &EmergencyConfig,
+        now: Instant,
+    ) -> ThermalState {
+        let gap = self
+            .last_sample
+            .map(|last| now.saturating_duration_since(last));
+        if gap.is_some_and(|gap| gap > FILTER_GAP_RESET) {
+            self.filters = Default::default();
+            self.reset_timers();
+        }
+        let credit = gap.unwrap_or_default().min(MAX_SAMPLE_CREDIT);
+        self.last_sample = Some(now);
+        let raw = [
+            reading.cpu.as_ref().ok().copied(),
+            reading.gpu.as_ref().ok().copied().flatten(),
+        ];
+        if matches!(reading.gpu, Ok(None)) {
+            self.filters[1] = ThermalFilter::default();
+        }
+        for ((filtered, filter), raw) in self.filtered.iter_mut().zip(&mut self.filters).zip(raw) {
+            *filtered = raw.map(|value| filter.push(value));
+        }
+        self.log_spike(raw, now);
+
+        let limit = limits.limits();
+        let complete = reading.complete().is_ok();
+        let filtered = self.filtered;
+        // A valid hot reading counts even when the other sensor fails.
+        let any_at =
+            |margin: f32| (0..2).any(|i| filtered[i].is_some_and(|t| t >= limit[i] + margin));
+        // Cooling only counts when every required reading is valid.
+        let all_below = |margin: f32| {
+            complete && (0..2).all(|i| filtered[i].is_none_or(|t| t < limit[i] + margin))
+        };
+        let advance = |timer: &mut Duration, rising: bool, reset: bool| {
+            if rising {
+                *timer += credit;
+            } else if reset {
+                *timer = Duration::ZERO;
+            }
+        };
+        self.hot = any_at(0.0);
+        advance(&mut self.over, self.hot, all_below(-TRIGGER_HOLD_C));
+        advance(
+            &mut self.critical,
+            any_at(CRITICAL_MARGIN_C),
+            all_below(CRITICAL_MARGIN_C - TRIGGER_HOLD_C),
+        );
+
+        if self.active {
+            advance(
+                &mut self.safe,
+                all_below(-RELEASE_MARGIN_C),
+                !all_below(-RELEASE_MARGIN_C),
+            );
+            if self.safe >= Duration::from_secs(limits.release_seconds.into()) {
+                eprintln!(
+                    "asense thermal emergency released after {} s below limit − {RELEASE_MARGIN_C}°C",
+                    self.safe.as_secs()
+                );
+                self.active = false;
+                self.reason = None;
+                self.reset_timers();
+            }
+            return self.state();
+        }
+        let trigger = Duration::from_secs(limits.trigger_seconds.into());
+        if self.over >= trigger || self.critical >= CRITICAL_DELAY {
+            let (margin, held, note) = if self.over >= trigger {
+                (0.0, self.over, "")
+            } else {
+                (CRITICAL_MARGIN_C, self.critical, " (fast trip)")
+            };
+            let sensor = (0..2)
+                .find(|&i| filtered[i].is_some_and(|t| t >= limit[i] + margin))
+                .unwrap_or(0);
+            let reason = format!(
+                "{} {:.1}°C (filtered, raw {}) at or above {}°C for {} s{note}",
+                SENSOR_NAMES[sensor],
+                filtered[sensor].unwrap_or_default(),
+                raw[sensor].map_or_else(|| "unavailable".into(), |t| format!("{t:.1}°C")),
+                limit[sensor] + margin,
+                held.as_secs(),
+            );
+            eprintln!("asense thermal emergency: {reason}");
+            self.reason = Some(reason);
+            self.active = true;
+            self.safe = Duration::ZERO;
+        }
+        self.state()
+    }
+
+    fn log_spike(&mut self, raw: [Option<f32>; 2], now: Instant) {
+        if self
+            .last_spike_log
+            .is_some_and(|last| now.saturating_duration_since(last) < SPIKE_LOG_INTERVAL)
+        {
+            return;
+        }
+        for sensor in 0..2 {
+            if let (Some(raw), Some(filtered)) = (raw[sensor], self.filtered[sensor])
+                && raw - filtered >= SPIKE_LOG_C
+            {
+                eprintln!(
+                    "asense {} reading {raw:.1}°C smoothed to {filtered:.1}°C (spike filter)",
+                    SENSOR_NAMES[sensor]
+                );
+                self.last_spike_log = Some(now);
+                return;
+            }
         }
     }
 }
@@ -303,25 +561,6 @@ impl TemperatureReading {
             .cloned()
             .collect::<Vec<_>>()
             .join("; ")
-    }
-    pub fn thermal_fault(&self, limits: &EmergencyConfig) -> Option<String> {
-        if let Ok(cpu) = self.cpu
-            && cpu >= f32::from(limits.cpu_limit)
-        {
-            return Some(format!(
-                "CPU {cpu:.1}°C reached emergency limit {}°C",
-                limits.cpu_limit
-            ));
-        }
-        if let Ok(Some(gpu)) = self.gpu
-            && gpu >= f32::from(limits.gpu_limit)
-        {
-            return Some(format!(
-                "GPU {gpu:.1}°C reached emergency limit {}°C",
-                limits.gpu_limit
-            ));
-        }
-        None
     }
 }
 impl From<Result<(f32, Option<f32>), String>> for TemperatureReading {
@@ -602,13 +841,12 @@ pub(crate) struct CurveRuntime {
     pub status: CurveStatus,
     pub limits: EmergencyConfig,
     last_reading: Option<TemperatureReading>,
-    emergency_reason: Option<String>,
     logged_fault: Option<String>,
     next_tick: Instant,
     last_tick: Instant,
     ramps: [Ramp; 2],
-    emergency: bool,
-    safe_samples: u8,
+    guard: ThermalGuard,
+    sensor_safe_samples: u8,
     paused: bool,
     sensor_fault_since: Option<Instant>,
     sensor_fallback: bool,
@@ -623,7 +861,6 @@ impl CurveRuntime {
         Self {
             limits: EmergencyConfig::default(),
             last_reading: None,
-            emergency_reason: None,
             logged_fault: None,
             status: CurveStatus {
                 state: if config.enabled {
@@ -639,8 +876,8 @@ impl CurveRuntime {
             next_tick: Instant::now(),
             last_tick: Instant::now(),
             ramps: [Ramp::default(), Ramp::default()],
-            emergency: false,
-            safe_samples: 0,
+            guard: ThermalGuard::default(),
+            sensor_safe_samples: 0,
             paused: false,
             sensor_fault_since: None,
             sensor_fallback: false,
@@ -672,6 +909,10 @@ impl CurveRuntime {
         self.verified_manual = None;
         self.maximum_verified = false;
         self.next_audit = Instant::now();
+    }
+
+    pub(crate) fn thermal_emergency_active(&self) -> bool {
+        self.guard.active()
     }
 
     fn ensure_maximum(
@@ -716,6 +957,23 @@ impl CurveRuntime {
         Ok(())
     }
 
+    /// Curve targets from filtered temperatures; `offset` applies decrease hysteresis.
+    fn curve_targets(&self, config: &CurveConfig, gpu_sleeping: bool, offset: f32) -> [u8; 2] {
+        [
+            self.guard
+                .filtered(0)
+                .map_or(80, |cpu| interpolate(&config.cpu, cpu + offset)),
+            if gpu_sleeping {
+                config.gpu[0].percent
+            } else {
+                self.guard
+                    .filtered(1)
+                    .map_or(80, |gpu| interpolate(&config.gpu, gpu + offset))
+            },
+        ]
+        .map(curve_speed_step)
+    }
+
     pub fn activate(
         &mut self,
         config: CurveConfig,
@@ -725,15 +983,26 @@ impl CurveRuntime {
     ) -> Result<(), String> {
         config.validate()?;
         let reading = sampler.read(hardware);
-        if let Some(error) = reading.thermal_fault(&self.limits) {
-            return Err(error);
+        // A running curve may already have filtered this cached sample.
+        let thermal =
+            if reading.sampled_at.is_some() && reading.sampled_at == self.last_processed_sample {
+                self.guard.state()
+            } else {
+                self.guard.observe(&reading, &self.limits, Instant::now())
+            };
+        if thermal == ThermalState::Emergency {
+            return Err(self
+                .guard
+                .reason()
+                .unwrap_or("thermal emergency active")
+                .into());
         }
-        let (cpu, gpu) = reading.complete()?;
-        let targets = [
-            interpolate(&config.cpu, cpu),
-            gpu.map_or(config.gpu[0].percent, |t| interpolate(&config.gpu, t)),
-        ]
-        .map(curve_speed_step);
+        reading.complete()?;
+        let targets = if thermal == ThermalState::Pending {
+            [100, 100]
+        } else {
+            self.curve_targets(&config, matches!(reading.gpu, Ok(None)), 0.0)
+        };
         hardware
             .apply_fan_setting(FanSetting::Manual {
                 cpu_percent: targets[0],
@@ -748,15 +1017,23 @@ impl CurveRuntime {
             ));
         }
         let limits = self.limits.clone();
+        let guard = std::mem::take(&mut self.guard);
         *self = Self::new(config);
         self.limits = limits;
+        self.guard = guard;
+        self.last_processed_sample = reading.sampled_at;
         self.last_reading = Some(reading);
         self.status.requested = Some(targets);
         self.verified_manual = Some(targets);
         self.next_audit = Instant::now() + CONTROL_AUDIT_INTERVAL;
         self.ramps[0].current = Some(targets[0]);
         self.ramps[1].current = Some(targets[1]);
-        self.status.state = "running".into();
+        self.status.state = if thermal == ThermalState::Pending {
+            "emergency-pending"
+        } else {
+            "running"
+        }
+        .into();
         self.next_tick = Instant::now() + Duration::from_secs(1);
         Ok(())
     }
@@ -803,7 +1080,10 @@ impl CurveRuntime {
             }
             self.logged_fault = Some(self.status.state.clone());
             self.status.fault = Some(error);
-        } else if self.status.state == "running" {
+        } else if matches!(
+            self.status.state.as_str(),
+            "running" | "emergency-pending" | "emergency"
+        ) {
             self.logged_fault = None;
         }
         crate::timing::context(&self.status.state, self.status.requested);
@@ -811,7 +1091,7 @@ impl CurveRuntime {
 
     pub(crate) fn set_limits(&mut self, limits: EmergencyConfig) {
         self.limits = limits;
-        self.safe_samples = 0;
+        self.guard.reset_timers();
         self.next_tick = Instant::now();
     }
     pub(crate) fn emergency_status(&self) -> EmergencyStatus {
@@ -823,12 +1103,12 @@ impl CurveRuntime {
                 "firmware-managed".into()
             },
             self.last_reading.as_ref(),
-            if self.emergency {
-                self.emergency_reason.clone()
+            if self.guard.active() {
+                self.guard.reason().map(str::to_owned)
             } else {
                 self.status.fault.clone()
             },
-            if self.emergency { self.safe_samples } else { 0 },
+            &self.guard,
         )
     }
 
@@ -844,47 +1124,36 @@ impl CurveRuntime {
         }
         self.last_processed_sample = reading.sampled_at;
         self.last_reading = Some(reading.clone());
-        if let Some(error) = reading.thermal_fault(&self.limits) {
-            self.emergency = true;
-            self.emergency_reason = Some(error.clone());
-            self.safe_samples = 0;
+        let was_emergency = self.guard.active();
+        let thermal = self.guard.observe(&reading, &self.limits, now);
+        if thermal == ThermalState::Emergency {
+            let reason = self
+                .guard
+                .reason()
+                .unwrap_or("thermal emergency")
+                .to_owned();
             self.status.state = "emergency".into();
+            self.status.fault = Some(reason.clone());
             crate::timing::context("emergency", Some([100, 100]));
-            match self.ensure_maximum(hardware, now) {
-                Ok(()) => self.status.requested = Some([100, 100]),
-                Err(e) => {
-                    self.status.state = "control-fault".into();
-                    return Err(format!("{error}; Maximum failed: {e}"));
-                }
-            }
-            self.status.fault = Some(error.clone());
-            return Err(error);
+            self.ensure_maximum(hardware, now).map_err(|e| {
+                self.status.state = "control-fault".into();
+                format!("{reason}; Maximum failed: {e}")
+            })?;
+            self.status.requested = Some([100, 100]);
+            return Ok(());
         }
-        let complete = reading.complete();
-        if self.emergency {
-            if self.limits.safe(&reading) {
-                self.safe_samples += 1;
-            } else {
-                self.safe_samples = 0;
-            }
-            if self.safe_samples < 5 {
-                self.ensure_maximum(hardware, now).map_err(|e| {
-                    self.status.state = "control-fault".into();
-                    format!("Maximum failed: {e}")
-                })?;
-                self.status.requested = Some([100, 100]);
-                self.status.state = "emergency".into();
-                return Ok(());
-            }
-            self.emergency = false;
-            self.emergency_reason = None;
+        if was_emergency {
+            // Released: re-enter Manual from fresh filtered readings.
             self.sensor_fault_since = None;
             self.sensor_fallback = false;
+            self.sensor_safe_samples = 0;
             self.reset();
         }
+        let pending = thermal == ThermalState::Pending;
+        let complete = reading.complete();
         let mut fallback = false;
         if complete.is_err() {
-            self.safe_samples = 0;
+            self.sensor_safe_samples = 0;
             let since = *self.sensor_fault_since.get_or_insert(now);
             let error = reading.errors();
             self.status.fault = Some(error.clone());
@@ -900,8 +1169,8 @@ impl CurveRuntime {
             self.sensor_fallback = true;
             fallback = true;
         } else if self.sensor_fault_since.is_some() {
-            self.safe_samples += 1;
-            if self.safe_samples < 5 {
+            self.sensor_safe_samples += 1;
+            if self.sensor_safe_samples < 5 {
                 if !self.sensor_fallback
                     && self
                         .sensor_fault_since
@@ -916,28 +1185,24 @@ impl CurveRuntime {
             } else {
                 self.sensor_fault_since = None;
                 self.sensor_fallback = false;
-                self.safe_samples = 0;
+                self.sensor_safe_samples = 0;
                 self.ramps = [Ramp::default(), Ramp::default()];
             }
         }
-        let curve_targets = |offset: f32| {
-            [
-                reading.cpu.as_ref().map_or(80, |cpu| {
-                    interpolate(&self.status.config.cpu, *cpu + offset)
-                }),
-                reading.gpu.as_ref().map_or(80, |gpu| {
-                    gpu.map_or(self.status.config.gpu[0].percent, |t| {
-                        interpolate(&self.status.config.gpu, t + offset)
-                    })
-                }),
-            ]
-            .map(curve_speed_step)
+        let gpu_sleeping = matches!(reading.gpu, Ok(None));
+        // While a limit is reached but not yet confirmed, run at full Manual speed:
+        // the trigger delay must never reduce cooling.
+        let desired = if pending {
+            [100, 100]
+        } else {
+            self.curve_targets(&self.status.config, gpu_sleeping, 0.0)
         };
-        let desired = curve_targets(0.0);
         let mut targets = if fallback {
             [desired[0].max(80), desired[1].max(80)]
+        } else if pending {
+            desired
         } else {
-            let down = curve_targets(DECREASE_HYSTERESIS_C);
+            let down = self.curve_targets(&self.status.config, gpu_sleeping, DECREASE_HYSTERESIS_C);
             [
                 self.ramps[0].target(desired[0], down[0], now),
                 self.ramps[1].target(desired[1], down[1], now),
@@ -1005,7 +1270,12 @@ impl CurveRuntime {
                 targets[0], targets[1]
             ));
         } else {
-            self.status.state = "running".into();
+            self.status.state = if pending {
+                "emergency-pending"
+            } else {
+                "running"
+            }
+            .into();
             self.status.fault = None;
         }
         Ok(())
@@ -1070,6 +1340,35 @@ mod tests {
         }
     }
 
+    /// Steps one fresh reading per second from `from` until Emergency engages.
+    fn engage(
+        runtime: &mut CurveRuntime,
+        hardware: &AcerHardware,
+        reading: impl Fn() -> TemperatureReading,
+        from: Instant,
+    ) -> Instant {
+        for second in 0..200 {
+            let now = from + Duration::from_secs(second);
+            let _ = runtime.step(hardware, reading(), now);
+            if runtime.guard.active() {
+                return now;
+            }
+        }
+        panic!("sustained heat did not engage Emergency");
+    }
+    fn ok(cpu: f32, gpu: f32) -> TemperatureReading {
+        TemperatureReading::from(Ok((cpu, Some(gpu))))
+    }
+    fn short_delays(cpu_limit: u8, gpu_limit: u8) -> EmergencyConfig {
+        EmergencyConfig {
+            schema: 1,
+            cpu_limit,
+            gpu_limit,
+            trigger_seconds: 10,
+            release_seconds: 10,
+        }
+    }
+
     #[test]
     fn explicit_manual_percentages_are_not_quantized() {
         let f = Fixture::new();
@@ -1097,6 +1396,7 @@ mod tests {
     }
 
     #[test]
+
     fn activation_and_ticks_use_same_rounded_targets_and_preserve_points() {
         let f = Fixture::new();
         fs::write(f.hwmon().join("temp1_input"), "66000").unwrap();
@@ -1121,30 +1421,18 @@ mod tests {
             .step(&f.hardware, Ok((66.0, Some(51.0))), now)
             .unwrap();
         assert_eq!(runtime.status.requested, Some([65, 45]));
-        runtime
-            .step(
-                &f.hardware,
-                Ok((67.0, Some(52.0))),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
-        assert_eq!(runtime.status.requested, Some([65, 45]));
-        runtime
-            .step(
-                &f.hardware,
-                Ok((68.0, Some(53.0))),
-                now + Duration::from_secs(2),
-            )
-            .unwrap();
-        // A five-point rise is debounced for one sample.
-        assert_eq!(runtime.status.requested, Some([65, 45]));
-        runtime
-            .step(
-                &f.hardware,
-                Ok((68.0, Some(53.0))),
-                now + Duration::from_secs(3),
-            )
-            .unwrap();
+        // A small sustained rise arrives through the filter in a few seconds.
+        for second in 1..=10 {
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((68.0, Some(53.0))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+            let requested = runtime.status.requested.unwrap();
+            assert!(requested[0] <= 70 && requested[1] <= 50);
+        }
         assert_eq!(runtime.status.requested, Some([70, 50]));
     }
 
@@ -1222,6 +1510,7 @@ mod tests {
     }
 
     #[test]
+
     fn changed_channel_write_failure_triggers_control_fault_before_audit() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
@@ -1231,50 +1520,44 @@ mod tests {
             .unwrap();
         fs::remove_file(f.hwmon().join("pwm1")).unwrap();
         fs::create_dir(f.hwmon().join("pwm1")).unwrap();
-        assert!(
+        let failed = (1..=10).any(|second| {
             runtime
                 .step(
                     &f.hardware,
                     Ok((70.0, Some(50.0))),
-                    now + Duration::from_secs(1)
+                    now + Duration::from_secs(second),
                 )
                 .is_err()
-        );
+        });
+        assert!(failed);
         assert_eq!(runtime.status.state, "control-fault");
         assert!(runtime.verified_manual.is_none());
         assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
     }
 
     #[test]
+
     fn emergency_audit_repairs_external_mode_override() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
-        let now = Instant::now();
-        assert!(
-            runtime
-                .step(&f.hardware, Ok((95.0, Some(50.0))), now)
-                .is_err()
-        );
+        let engaged = engage(&mut runtime, &f.hardware, || ok(95.0, 50.0), Instant::now());
+        assert_eq!(runtime.status.state, "emergency");
         fs::write(f.hwmon().join("pwm2_enable"), "2").unwrap();
-        assert!(
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(4)
-                )
-                .is_err()
-        );
+        runtime
+            .step(
+                &f.hardware,
+                ok(95.0, 50.0),
+                engaged + Duration::from_secs(4),
+            )
+            .unwrap();
         assert_eq!(f.hardware.read_fan_modes().unwrap()[1], FanMode::Automatic);
-        assert!(
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(5)
-                )
-                .is_err()
-        );
+        runtime
+            .step(
+                &f.hardware,
+                ok(95.0, 50.0),
+                engaged + Duration::from_secs(5),
+            )
+            .unwrap();
         assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
     }
 
@@ -1311,6 +1594,7 @@ mod tests {
     }
 
     #[test]
+
     fn rising_targets_update_only_changed_channel_before_audit() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
@@ -1320,13 +1604,15 @@ mod tests {
             .unwrap();
         // If the GPU speed were read, verified, or rewritten, this sentinel would fail or change.
         fs::write(f.hwmon().join("pwm2"), "external-override").unwrap();
-        runtime
-            .step(
-                &f.hardware,
-                Ok((70.0, Some(50.0))),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        for second in 1..=10 {
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((70.0, Some(50.0))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
         assert_eq!(runtime.status.requested, Some([70, 40]));
         assert_eq!(
             fs::read_to_string(f.hwmon().join("pwm2")).unwrap(),
@@ -1410,44 +1696,30 @@ mod tests {
     }
 
     #[test]
-    fn emergency_is_immediate_and_confirmed_maximum_is_audited_without_pwm() {
+
+    fn emergency_is_timed_and_confirmed_maximum_is_audited_without_pwm() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
         let now = Instant::now();
         runtime
             .step(&f.hardware, Ok((60.0, Some(50.0))), now)
             .unwrap();
-        assert!(
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(1)
-                )
-                .is_err()
-        );
+        let start = now + Duration::from_secs(1);
+        let t = engage(&mut runtime, &f.hardware, || ok(95.0, 50.0), start);
+        // 95 °C is below the fast-trip margin, so the full trigger delay applies.
+        assert!(t >= start + Duration::from_secs(60));
         assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
         // No redundant Maximum commands between audits, even with an unavailable mode node.
         fs::remove_file(f.hwmon().join("pwm2_enable")).unwrap();
-        for second in 2..6 {
-            assert!(
-                runtime
-                    .step(
-                        &f.hardware,
-                        Ok((95.0, Some(50.0))),
-                        now + Duration::from_secs(second)
-                    )
-                    .is_err()
-            );
+        for second in 1..5 {
+            runtime
+                .step(&f.hardware, ok(95.0, 50.0), t + Duration::from_secs(second))
+                .unwrap();
             assert_eq!(runtime.status.state, "emergency");
         }
         assert!(
             runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(6)
-                )
+                .step(&f.hardware, ok(95.0, 50.0), t + Duration::from_secs(5))
                 .is_err()
         );
         assert_eq!(runtime.status.state, "control-fault");
@@ -1455,26 +1727,14 @@ mod tests {
         fs::write(f.hwmon().join("pwm2_enable"), "2").unwrap();
         fs::remove_file(f.hwmon().join("pwm1")).unwrap();
         fs::remove_file(f.hwmon().join("pwm2")).unwrap();
-        assert!(
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(7)
-                )
-                .is_err()
-        );
+        runtime
+            .step(&f.hardware, ok(95.0, 50.0), t + Duration::from_secs(6))
+            .unwrap();
         assert_eq!(runtime.status.state, "emergency");
         assert!(runtime.maximum_verified);
-        assert!(
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((95.0, Some(50.0))),
-                    now + Duration::from_secs(12)
-                )
-                .is_err()
-        );
+        runtime
+            .step(&f.hardware, ok(95.0, 50.0), t + Duration::from_secs(11))
+            .unwrap();
         assert_eq!(runtime.status.state, "emergency");
         assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
     }
@@ -1500,7 +1760,7 @@ mod tests {
             );
             assert_eq!(runtime.status.state, "sensor-hold");
             assert_eq!(runtime.status.requested, Some([70, 50]));
-            assert!(!runtime.emergency);
+            assert!(!runtime.guard.active());
         }
         runtime
             .step(&f.hardware, missing(), now + Duration::from_secs(4))
@@ -1538,28 +1798,43 @@ mod tests {
     }
 
     #[test]
+
     fn partial_hot_readings_trigger_thermal_emergency() {
         let f = Fixture::new();
-        for reading in [
-            TemperatureReading {
+        let readings: [fn() -> TemperatureReading; 2] = [
+            || TemperatureReading {
                 cpu: Ok(92.0),
                 gpu: Err("GPU read failed".into()),
                 sampled_at: None,
             },
-            TemperatureReading {
+            || TemperatureReading {
                 cpu: Err("CPU read failed".into()),
                 gpu: Ok(Some(84.0)),
                 sampled_at: None,
             },
-        ] {
+        ];
+        for reading in readings {
             let mut runtime = f.runtime();
-            assert!(runtime.step(&f.hardware, reading, Instant::now()).is_err());
+            let start = Instant::now();
+            // Before confirmation, the missing sensor and the hot one both demand full speed.
+            for second in 0..5 {
+                let _ = runtime.step(&f.hardware, reading(), start + Duration::from_secs(second));
+            }
+            assert_eq!(runtime.guard.state(), ThermalState::Pending);
+            assert_eq!(runtime.status.requested, Some([100, 100]));
+            engage(
+                &mut runtime,
+                &f.hardware,
+                reading,
+                start + Duration::from_secs(5),
+            );
             assert_eq!(runtime.status.state, "emergency");
             assert_eq!(runtime.status.requested, Some([100, 100]));
         }
     }
 
     #[test]
+
     fn sampler_preserves_hot_gpu_when_cpu_read_fails() {
         let f = Fixture::new();
         fs::write(f.hwmon().join("temp1_input"), "invalid").unwrap();
@@ -1568,8 +1843,9 @@ mod tests {
         assert!(reading.cpu.is_err());
         assert_eq!(reading.gpu, Ok(Some(84.0)));
         let mut runtime = f.runtime();
-        assert!(runtime.step(&f.hardware, reading, Instant::now()).is_err());
-        assert!(runtime.emergency);
+        runtime.step(&f.hardware, reading, Instant::now()).unwrap();
+        assert_eq!(runtime.guard.state(), ThermalState::Pending);
+        assert_eq!(runtime.status.requested, Some([100, 100]));
     }
 
     #[test]
@@ -1599,7 +1875,7 @@ mod tests {
                 .step(&f.hardware, fresh.clone(), now + Duration::from_secs(1))
                 .unwrap();
         }
-        assert_eq!(runtime.safe_samples, 1);
+        assert_eq!(runtime.sensor_safe_samples, 1);
         assert_eq!(runtime.status.state, "sensor-fault");
         runtime
             .step(
@@ -1612,7 +1888,7 @@ mod tests {
                 now + Duration::from_secs(2),
             )
             .unwrap();
-        assert_eq!(runtime.safe_samples, 0);
+        assert_eq!(runtime.sensor_safe_samples, 0);
     }
 
     #[test]
@@ -1644,7 +1920,7 @@ mod tests {
         );
         assert_eq!(runtime.status.state, "control-fault");
         assert_eq!(runtime.status.requested, Some([70, 50]));
-        assert!(!runtime.emergency);
+        assert!(!runtime.guard.active());
         assert_eq!(CurveConfig::load(&f.config_path()).unwrap(), config);
     }
 
@@ -1815,6 +2091,7 @@ mod tests {
             schema: 1,
             cpu_limit: 100,
             gpu_limit: 90,
+            ..Default::default()
         };
         limits.save(&path).unwrap();
         assert_eq!(EmergencyConfig::load(&path).unwrap(), limits);
@@ -1829,7 +2106,8 @@ mod tests {
                 EmergencyConfig {
                     schema: 1,
                     cpu_limit,
-                    gpu_limit
+                    gpu_limit,
+                    ..Default::default()
                 }
                 .save(&path)
                 .is_err()
@@ -1842,64 +2120,75 @@ mod tests {
     }
 
     #[test]
+
     fn configured_limits_and_hysteresis_require_fresh_samples() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
         runtime.set_limits(EmergencyConfig {
-            schema: 1,
             cpu_limit: 100,
             gpu_limit: 90,
+            ..short_delays(100, 90)
         });
         let now = Instant::now();
-        runtime
-            .step(&f.hardware, Ok((99.0, Some(89.0))), now)
-            .unwrap();
-        assert!(!runtime.emergency);
-        assert!(
-            runtime
-                .step(&f.hardware, Ok((100.0, Some(55.0))), now)
-                .is_err()
+        runtime.step(&f.hardware, ok(99.0, 89.0), now).unwrap();
+        assert_eq!(runtime.guard.state(), ThermalState::Normal);
+        let t = engage(
+            &mut runtime,
+            &f.hardware,
+            || ok(100.0, 55.0),
+            now + Duration::from_secs(1),
         );
         assert_eq!(runtime.emergency_status().config.cpu_limit, 100);
         assert!(runtime.emergency_status().reason.unwrap().contains("100°C"));
-        runtime
-            .step(&f.hardware, Ok((95.0, Some(55.0))), now)
-            .unwrap();
-        assert_eq!(runtime.safe_samples, 0); // Must be strictly below limit minus five.
-        let reading = TemperatureReading {
-            cpu: Ok(94.0),
-            gpu: Ok(Some(84.0)),
-            sampled_at: Some(now),
-        };
-        for _ in 0..20 {
-            runtime.step(&f.hardware, reading.clone(), now).unwrap();
+        // 95 °C is not strictly below the limit minus five.
+        for second in 1..=20 {
+            runtime
+                .step(&f.hardware, ok(95.0, 55.0), t + Duration::from_secs(second))
+                .unwrap();
         }
-        assert_eq!(runtime.safe_samples, 1);
+        assert!(runtime.guard.active());
+        assert_eq!(runtime.emergency_status().release_seconds_elapsed, 0);
+        let t = t + Duration::from_secs(20);
+        // Repeated cached samples do not advance recovery.
+        let cached = TemperatureReading {
+            cpu: Ok(90.0),
+            gpu: Ok(Some(84.0)),
+            sampled_at: Some(t + Duration::from_secs(1)),
+        };
+        for _ in 0..100 {
+            runtime
+                .step(&f.hardware, cached.clone(), t + Duration::from_secs(1))
+                .unwrap();
+        }
         runtime.set_limits(EmergencyConfig {
-            schema: 1,
             cpu_limit: 100,
             gpu_limit: 90,
+            ..short_delays(100, 90)
         });
-        assert!(runtime.emergency);
-        assert_eq!(runtime.safe_samples, 0);
-        for second in 1..=5 {
+        assert!(runtime.guard.active());
+        assert_eq!(runtime.emergency_status().release_seconds_elapsed, 0);
+        let mut second = 2;
+        while runtime.guard.active() {
+            assert!(second < 40, "fresh safe samples must release");
             runtime
                 .step(
                     &f.hardware,
                     TemperatureReading {
-                        cpu: Ok(94.0),
+                        cpu: Ok(90.0),
                         gpu: Ok(Some(84.0)),
-                        sampled_at: Some(now + Duration::from_secs(second)),
+                        sampled_at: Some(t + Duration::from_secs(second)),
                     },
-                    now + Duration::from_secs(second),
+                    t + Duration::from_secs(second),
                 )
                 .unwrap();
+            second += 1;
         }
-        assert!(!runtime.emergency);
+        assert!(second > 10);
         assert_eq!(runtime.status.state, "running");
     }
 
     #[test]
+
     fn changing_limits_and_curve_ownership_preserves_saved_emergency_limits() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
@@ -1907,6 +2196,7 @@ mod tests {
             schema: 1,
             cpu_limit: 80,
             gpu_limit: 75,
+            ..Default::default()
         };
         runtime.set_limits(limits.clone());
         runtime
@@ -1918,17 +2208,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.limits, limits);
-        assert!(
+        let now = Instant::now();
+        for second in 0..10 {
             runtime
-                .step(&f.hardware, Ok((80.0, Some(55.0))), Instant::now())
-                .is_err()
-        );
+                .step(
+                    &f.hardware,
+                    ok(80.0, 55.0),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
+        assert_eq!(runtime.status.state, "emergency-pending");
+        assert_eq!(runtime.status.requested, Some([100, 100]));
         runtime.disable(&f.config_path()).unwrap();
         assert_eq!(runtime.limits, limits);
         assert_eq!(runtime.emergency_status().state, "firmware-managed");
     }
 
     #[test]
+
     fn sustained_heating_updates_manual_without_mode_transitions() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
@@ -1945,13 +2243,15 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        runtime
-            .step(
-                &f.hardware,
-                Ok((70.0, Some(65.0))),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        for second in 1..=10 {
+            runtime
+                .step(
+                    &f.hardware,
+                    Ok((70.0, Some(65.0))),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
         assert_eq!(runtime.status.requested, Some([70, 70]));
         assert_eq!(
             fs::metadata(f.hwmon().join("pwm1_enable"))
@@ -1977,7 +2277,7 @@ mod tests {
             .step(
                 &f.hardware,
                 Ok((70.0, Some(65.0))),
-                now + Duration::from_secs(2),
+                now + Duration::from_secs(11),
             )
             .unwrap();
         assert_eq!(
@@ -1990,38 +2290,235 @@ mod tests {
     }
 
     #[test]
-    fn thermal_limits_require_five_safe_samples() {
-        for reading in [Ok((92.0, Some(55.0))), Ok((65.0, Some(84.0)))] {
+
+    fn thermal_limits_require_sustained_safe_readings() {
+        for hot in [ok(92.0, 55.0), ok(65.0, 84.0)] {
             let f = Fixture::new();
             let mut runtime = f.runtime();
-            let now = Instant::now();
-            assert!(runtime.step(&f.hardware, reading, now).is_err());
+            runtime.set_limits(short_delays(92, 84));
+            let t = engage(&mut runtime, &f.hardware, || hot.clone(), Instant::now());
             assert_eq!(
                 f.hardware.read_fan_state().unwrap().cpu.mode,
                 Some(FanMode::Maximum)
             );
-            for second in 1..5 {
+            let mut second = 1;
+            while runtime.guard.active() {
+                assert!(second < 40, "safe readings must release");
                 runtime
-                    .step(
-                        &f.hardware,
-                        Ok((65.0, Some(55.0))),
-                        now + Duration::from_secs(second),
-                    )
+                    .step(&f.hardware, ok(65.0, 55.0), t + Duration::from_secs(second))
                     .unwrap();
-                assert!(runtime.emergency);
+                assert!(runtime.guard.active() || second >= 10);
+                second += 1;
             }
-            runtime
-                .step(
-                    &f.hardware,
-                    Ok((65.0, Some(55.0))),
-                    now + Duration::from_secs(5),
-                )
-                .unwrap();
-            assert!(!runtime.emergency);
             assert_eq!(runtime.status.state, "running");
             assert_eq!(
                 f.hardware.read_fan_state().unwrap().cpu.mode,
                 Some(FanMode::Manual)
+            );
+        }
+    }
+
+    #[test]
+    fn idle_spikes_cause_no_fan_writes_or_emergency() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime.step(&f.hardware, ok(55.0, 50.0), now).unwrap();
+        for second in 1..5 {
+            runtime
+                .step(
+                    &f.hardware,
+                    ok(55.0, 50.0),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
+        let requested = runtime.status.requested;
+        let pwm = fs::metadata(f.hwmon().join("pwm1"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Arrow Lake-style package spikes: one and two samples near TjMax.
+        let pattern = [
+            100.0, 55.0, 55.0, 55.0, 55.0, 99.0, 101.0, 55.0, 55.0, 55.0, 55.0,
+        ];
+        for (index, cpu) in pattern.into_iter().cycle().take(120).enumerate() {
+            runtime
+                .step(
+                    &f.hardware,
+                    ok(cpu, 50.0),
+                    now + Duration::from_secs(5 + index as u64),
+                )
+                .unwrap();
+            assert_eq!(runtime.status.state, "running");
+            assert_eq!(runtime.status.requested, requested);
+        }
+        assert!(!runtime.guard.active());
+        assert_eq!(
+            fs::metadata(f.hwmon().join("pwm1"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            pwm
+        );
+    }
+
+    #[test]
+    fn sustained_load_reaches_full_speed_quickly_then_emergency_after_delay() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        for second in 0..5 {
+            runtime
+                .step(
+                    &f.hardware,
+                    ok(55.0, 50.0),
+                    now + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
+        let start = now + Duration::from_secs(5);
+        let mut full_speed = None;
+        for second in 0..10 {
+            runtime
+                .step(
+                    &f.hardware,
+                    ok(95.0, 50.0),
+                    start + Duration::from_secs(second),
+                )
+                .unwrap();
+            if runtime.status.requested.is_some_and(|r| r[0] == 100) && full_speed.is_none() {
+                full_speed = Some(second);
+            }
+        }
+        assert!(
+            full_speed.is_some_and(|second| second <= 6),
+            "{full_speed:?}"
+        );
+        assert_eq!(runtime.status.state, "emergency-pending");
+        assert!(!runtime.guard.active());
+        let engaged = engage(
+            &mut runtime,
+            &f.hardware,
+            || ok(95.0, 50.0),
+            start + Duration::from_secs(10),
+        );
+        let elapsed = engaged.duration_since(start).as_secs();
+        assert!((60..=70).contains(&elapsed), "{elapsed}");
+        assert_eq!(f.hardware.read_fan_modes().unwrap(), [FanMode::Maximum; 2]);
+    }
+
+    #[test]
+    fn far_over_limit_trips_fast() {
+        let f = Fixture::new();
+        let mut runtime = f.runtime();
+        let now = Instant::now();
+        runtime.step(&f.hardware, ok(55.0, 50.0), now).unwrap();
+        let start = now + Duration::from_secs(1);
+        let engaged = engage(&mut runtime, &f.hardware, || ok(99.0, 50.0), start);
+        let elapsed = engaged.duration_since(start).as_secs();
+        assert!((10..=20).contains(&elapsed), "{elapsed}");
+        assert!(runtime.guard.reason().unwrap().contains("fast trip"));
+        // A long emergency keeps reporting values the GUI accepts.
+        for second in 1..=700 {
+            runtime
+                .step(
+                    &f.hardware,
+                    ok(99.0, 50.0),
+                    engaged + Duration::from_secs(second),
+                )
+                .unwrap();
+        }
+        let status = runtime.emergency_status();
+        assert_eq!(
+            (status.pending_seconds, status.release_seconds_elapsed),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn trigger_timer_holds_near_limit_and_resets_when_cool() {
+        let limits = short_delays(92, 84);
+        let mut guard = ThermalGuard::default();
+        let now = Instant::now();
+        let mut at = 0;
+        let mut observe = |guard: &mut ThermalGuard, cpu: f32| {
+            at += 1;
+            guard.observe(&ok(cpu, 50.0), &limits, now + Duration::from_secs(at))
+        };
+        for _ in 0..6 {
+            observe(&mut guard, 93.0);
+        }
+        assert!(!guard.over.is_zero());
+        // Dips within 3 °C below the limit hold the timer once the filter follows them.
+        for _ in 0..6 {
+            assert_eq!(observe(&mut guard, 90.5), ThermalState::Pending);
+        }
+        let held = guard.over;
+        for _ in 0..6 {
+            assert_eq!(observe(&mut guard, 90.5), ThermalState::Pending);
+        }
+        assert_eq!(guard.over, held);
+        // Cooling well below the limit resets it.
+        for _ in 0..10 {
+            observe(&mut guard, 70.0);
+        }
+        assert!(guard.over.is_zero());
+        assert_eq!(guard.state(), ThermalState::Normal);
+    }
+
+    #[test]
+    fn one_hot_reading_restarts_release_and_incomplete_readings_do_not_count() {
+        let limits = short_delays(92, 84);
+        let mut guard = ThermalGuard::default();
+        let now = Instant::now();
+        let mut second = 0;
+        while guard.observe(&ok(99.0, 50.0), &limits, now + Duration::from_secs(second))
+            != ThermalState::Emergency
+        {
+            second += 1;
+        }
+        for _ in 0..10 {
+            second += 1;
+            guard.observe(&ok(60.0, 50.0), &limits, now + Duration::from_secs(second));
+        }
+        assert!(guard.active());
+        assert!(guard.safe >= Duration::from_secs(5));
+        let incomplete = TemperatureReading {
+            cpu: Ok(60.0),
+            gpu: Err("GPU missing".into()),
+            sampled_at: None,
+        };
+        second += 1;
+        guard.observe(&incomplete, &limits, now + Duration::from_secs(second));
+        assert!(guard.safe.is_zero());
+        // Five hot samples defeat the median filter and restart the countdown.
+        for _ in 0..5 {
+            second += 1;
+            guard.observe(&ok(99.0, 50.0), &limits, now + Duration::from_secs(second));
+        }
+        assert!(guard.safe.is_zero());
+        assert!(guard.active());
+    }
+
+    #[test]
+    fn old_emergency_settings_load_with_default_delays() {
+        let f = Fixture::new();
+        let path = f.root.join("state/fan-emergency.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"schema":1,"cpu_limit":95,"gpu_limit":85}"#).unwrap();
+        let config = EmergencyConfig::load(&path).unwrap();
+        assert_eq!((config.cpu_limit, config.gpu_limit), (95, 85));
+        assert_eq!((config.trigger_seconds, config.release_seconds), (60, 60));
+        for (trigger_seconds, release_seconds) in [(9, 60), (301, 60), (60, 9), (60, 601)] {
+            assert!(
+                EmergencyConfig {
+                    trigger_seconds,
+                    release_seconds,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
             );
         }
     }
@@ -2044,7 +2541,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(!runtime.emergency);
+        assert!(!runtime.guard.active());
         assert_eq!(runtime.status.state, "control-fault");
         assert_eq!(
             fs::read_to_string(f.hwmon().join("pwm1_enable")).unwrap(),
@@ -2126,16 +2623,23 @@ mod tests {
     }
 
     #[test]
+
     fn profile_or_resume_mode_reset_reenters_manual_from_fresh_readings() {
         let f = Fixture::new();
         let mut runtime = f.runtime();
+        let now = Instant::now();
         runtime
-            .step(&f.hardware, Ok((70.0, Some(65.0))), Instant::now())
+            .step(&f.hardware, Ok((70.0, Some(65.0))), now)
             .unwrap();
         f.hardware.apply_fan_setting(FanSetting::Automatic).unwrap();
         runtime.reset();
+        // A resume gap discards filter history, so the first reading counts directly.
         runtime
-            .step(&f.hardware, Ok((50.0, Some(45.0))), Instant::now())
+            .step(
+                &f.hardware,
+                Ok((50.0, Some(45.0))),
+                now + Duration::from_secs(10),
+            )
             .unwrap();
         assert_eq!(runtime.status.requested, Some([35, 35]));
         assert_eq!(

@@ -37,10 +37,12 @@ time, which is too loud for daily use.
 ## What is different from upstream
 
 - **Auto Curve:** a fan mode where fan speed follows CPU and GPU temperature
-  using curves you can edit. It keeps running after you close the window, and
-  it comes back after a reboot.
+  using curves you can edit. Short temperature spikes are filtered out, so the
+  fans do not jump to full speed for a one-second spike. It keeps running after
+  you close the window, and it comes back after a reboot.
 - **Emergency limits:** a tab where you set the CPU and GPU temperatures at
-  which the fans go to maximum.
+  which the fans go to maximum, and how long a limit must be held before that
+  happens (60 s by default) and before it is released (60 s by default).
 - **Simpler UI:** the curve editor opens as a popup, and status messages are
   short and plain.
 
@@ -84,14 +86,42 @@ Afterward, open ASense from your app launcher or run `asense`.
 
 - **Auto Curve:** click it in the fan panel, edit the points, then click
   **Apply and enable**.
-- **Emergency** tab: set the CPU and GPU temperature limits.
+- **Emergency** tab: shows the protection state. **Edit** sets the CPU and GPU
+  temperature limits and the trigger and release delays.
+- **Window frame:** on tiling compositors (Hyprland, Sway, niri, i3, river and
+  similar) the top bar is hidden automatically. See
+  [Top bar](#top-bar) to change this.
 - **Firmware Auto:** gives fan control back to the laptop.
 - **Maximum:** runs both fans at full speed.
 
 > **Tip for gaming:** if you notice mouse or input lag while Auto Curve is
-> running, switch the fans to **Maximum**. Auto Curve adjusts the fans through
+> running, switch the fans to **Maximum or Manual**. Auto Curve adjusts the fans through
 > the laptop firmware, and those adjustments can cause short input pauses on
 > this laptop. The fix for this seems to work, but it still needs more testing.
+
+## Top bar
+
+Use `ASENSE_TITLEBAR` to always show or always hide the top bar:
+
+- `show`: always show it.
+- `hide`: always hide it.
+- Not set: hidden on tiling compositors, shown elsewhere.
+
+Close ASense first, then start it with the setting from a terminal:
+
+```bash
+ASENSE_TITLEBAR=show asense
+```
+
+To make it permanent on Hyprland, add this to your Hyprland config, then log
+out and back in:
+
+```lua
+hl.env("ASENSE_TITLEBAR", "show")
+```
+
+If your Hyprland config is `hyprland.conf` instead, use
+`env = ASENSE_TITLEBAR,show`.
 
 ## Update
 

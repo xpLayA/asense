@@ -942,17 +942,24 @@ fn execute_curve_command(
             };
             return serde_json::to_string(&status).map_err(|e| e.to_string());
         }
-        ["FAN", "EMERGENCY", "SET", cpu, gpu] => {
+        ["FAN", "EMERGENCY", "SET", cpu, gpu, delays @ ..] if matches!(delays.len(), 0 | 2) => {
+            let delay = |index: usize, current: u16, name: &str| -> Result<u16, String> {
+                delays.get(index).map_or(Ok(current), |value| {
+                    value.parse().map_err(|_| format!("invalid {name} delay"))
+                })
+            };
             let config = crate::fan_curve::EmergencyConfig {
                 schema: 1,
                 cpu_limit: cpu.parse().map_err(|_| "invalid CPU emergency limit")?,
                 gpu_limit: gpu.parse().map_err(|_| "invalid GPU emergency limit")?,
+                trigger_seconds: delay(0, curve.limits.trigger_seconds, "trigger")?,
+                release_seconds: delay(1, curve.limits.release_seconds, "release")?,
             };
             config.validate()?;
             let _guard = MutationGuard::acquire()?;
             config.save(Path::new(crate::fan_curve::EMERGENCY_SETTINGS_PATH))?;
             curve.set_limits(config);
-            watchdog.thermal_safe_samples = 0;
+            watchdog.guard.reset_timers();
             watchdog.next_tick = None;
             return Ok("emergency=settings-saved".into());
         }
@@ -972,11 +979,10 @@ fn execute_curve_command(
         ["FAN", "MANUAL", cpu, gpu] => {
             parse_manual_percent(cpu)?;
             parse_manual_percent(gpu)?;
-            let reading = sampler.read(hardware);
-            if let Some(error) = reading.thermal_fault(&curve.limits) {
-                return Err(error);
+            if curve.thermal_emergency_active() || watchdog.guard.active() {
+                return Err("thermal emergency active; Maximum cooling is required".into());
             }
-            reading.complete()?;
+            sampler.read(hardware).complete()?;
         }
         _ => {}
     }
@@ -1466,9 +1472,8 @@ struct ManualWatchdog {
     fault_since: Option<Instant>,
     original: Option<[u8; 2]>,
     safe_samples: u8,
-    thermal_safe_samples: u8,
-    emergency: bool,
-    reason: Option<String>,
+    guard: crate::fan_curve::ThermalGuard,
+    next_maximum_audit: Option<Instant>,
     last_reading: Option<crate::fan_curve::TemperatureReading>,
     last_processed_sample: Option<Instant>,
 }
@@ -1477,41 +1482,20 @@ impl ManualWatchdog {
         &self,
         config: crate::fan_curve::EmergencyConfig,
     ) -> crate::fan_curve::EmergencyStatus {
+        use crate::fan_curve::ThermalState;
         crate::fan_curve::EmergencyStatus::snapshot(
             config,
-            if self.emergency {
-                "emergency"
-            } else if self.fault_since.is_some() {
-                "sensor-fault"
-            } else {
-                "monitoring"
+            match self.guard.state() {
+                ThermalState::Emergency => "emergency",
+                ThermalState::Pending => "emergency-pending",
+                ThermalState::Normal if self.fault_since.is_some() => "sensor-fault",
+                ThermalState::Normal => "monitoring",
             }
             .into(),
             self.last_reading.as_ref(),
-            self.reason.clone(),
-            self.thermal_safe_samples,
+            self.guard.reason().map(str::to_owned),
+            &self.guard,
         )
-    }
-    fn observe_thermal(
-        &mut self,
-        reading: &crate::fan_curve::TemperatureReading,
-        limits: &crate::fan_curve::EmergencyConfig,
-    ) -> bool {
-        if let Some(reason) = reading.thermal_fault(limits) {
-            if !self.emergency {
-                eprintln!("asense Manual emergency: {reason}");
-            }
-            self.reason = Some(reason);
-            self.emergency = true;
-            self.thermal_safe_samples = 0;
-        } else if self.emergency {
-            if limits.safe(reading) {
-                self.thermal_safe_samples += 1;
-            } else {
-                self.thermal_safe_samples = 0;
-            }
-        }
-        self.emergency && self.thermal_safe_samples < 5
     }
 
     fn targets(&mut self, valid: bool, now: Instant) -> Option<[u8; 2]> {
@@ -1558,7 +1542,8 @@ fn enforce_thermal_watchdog(
     }
     watchdog.last_processed_sample = reading.sampled_at;
     watchdog.last_reading = Some(reading.clone());
-    if watchdog.observe_thermal(&reading, limits) {
+    let was_emergency = watchdog.guard.active();
+    if watchdog.guard.observe(&reading, limits, now) == crate::fan_curve::ThermalState::Emergency {
         if watchdog.original.is_none() {
             watchdog.original = hardware.read_fan_state().ok().map(|s| {
                 [
@@ -1568,12 +1553,24 @@ fn enforce_thermal_watchdog(
             });
         }
         *fan_session = FanSessionState::EmergencyMaximum;
+        // Confirmed Maximum is re-checked periodically, not rewritten every second:
+        // each firmware fan transaction can stall input handling.
+        if watchdog.next_maximum_audit.is_some_and(|next| now < next) {
+            return Ok(());
+        }
         let _guard = MutationGuard::acquire()?;
-        return hardware
-            .apply_maximum_failsafe()
-            .map_err(|e| format!("thermal failsafe failed: {e}"));
+        if watchdog.next_maximum_audit.is_none()
+            || hardware.read_fan_modes().ok() != Some([HardwareFanMode::Maximum; 2])
+        {
+            watchdog.next_maximum_audit = None;
+            hardware
+                .apply_maximum_failsafe()
+                .map_err(|e| format!("thermal failsafe failed: {e}"))?;
+        }
+        watchdog.next_maximum_audit = Some(now + Duration::from_secs(5));
+        return Ok(());
     }
-    if watchdog.emergency {
+    if was_emergency {
         let _guard = MutationGuard::acquire()?;
         if let Some(targets) = watchdog.original {
             hardware
@@ -1589,9 +1586,7 @@ fn enforce_thermal_watchdog(
                 .map_err(|e| format!("emergency Auto recovery failed: {e}"))?;
             *fan_session = FanSessionState::Automatic;
         }
-        watchdog.emergency = false;
-        watchdog.reason = None;
-        watchdog.thermal_safe_samples = 0;
+        watchdog.next_maximum_audit = None;
         watchdog.original = None;
         watchdog.fault_since = None;
     }
@@ -1941,32 +1936,54 @@ mod tests {
     }
 
     #[test]
-    fn manual_emergency_uses_configured_limits_and_five_safe_samples() {
+    fn manual_emergency_uses_configured_limits_and_timed_trigger_and_release() {
+        use crate::fan_curve::ThermalState;
         let limits = crate::fan_curve::EmergencyConfig {
             schema: 1,
             cpu_limit: 100,
             gpu_limit: 90,
+            trigger_seconds: 20,
+            release_seconds: 30,
         };
         let mut watchdog = ManualWatchdog::default();
-        let read = |cpu, gpu| crate::fan_curve::TemperatureReading::from(Ok((cpu, Some(gpu))));
-        assert!(!watchdog.observe_thermal(&read(99.0, 89.0), &limits));
-        assert!(watchdog.observe_thermal(&read(100.0, 60.0), &limits));
-        assert!(watchdog.reason.as_ref().unwrap().contains("100°C"));
-        assert!(watchdog.observe_thermal(&read(95.0, 60.0), &limits));
-        assert_eq!(watchdog.thermal_safe_samples, 0);
-        for _ in 0..4 {
-            assert!(watchdog.observe_thermal(&read(94.0, 84.0), &limits));
+        let start = Instant::now();
+        let observe = |watchdog: &mut ManualWatchdog, second: u64, cpu: f32, gpu: f32| {
+            watchdog.guard.observe(
+                &crate::fan_curve::TemperatureReading::from(Ok((cpu, Some(gpu)))),
+                &limits,
+                start + Duration::from_secs(second),
+            )
+        };
+        assert_eq!(observe(&mut watchdog, 0, 99.0, 89.0), ThermalState::Normal);
+        // A two-sample spike is filtered out.
+        assert_eq!(observe(&mut watchdog, 1, 120.0, 60.0), ThermalState::Normal);
+        assert_eq!(observe(&mut watchdog, 2, 120.0, 60.0), ThermalState::Normal);
+        let mut second = 3;
+        while observe(&mut watchdog, second, 101.0, 60.0) != ThermalState::Emergency {
+            assert!(second < 40, "sustained heat must trigger");
+            second += 1;
         }
-        assert!(!watchdog.observe_thermal(&read(94.0, 84.0), &limits));
-        assert_eq!(watchdog.thermal_safe_samples, 5);
+        assert!(second >= 20);
+        assert_eq!(watchdog.status(limits.clone()).state, "emergency");
+        assert!(watchdog.guard.reason().unwrap().contains("100°C"));
+        let cooled = second + 10;
+        for later in second + 1..cooled {
+            observe(&mut watchdog, later, 60.0, 60.0);
+        }
+        let mut released = cooled;
+        while observe(&mut watchdog, released, 60.0, 60.0) == ThermalState::Emergency {
+            assert!(released < cooled + 60, "safe readings must release");
+            released += 1;
+        }
+        assert!(released - second >= 30);
+        assert_eq!(watchdog.status(limits).state, "monitoring");
         assert!(!super::command_is_mutation(&["FAN", "EMERGENCY", "GET"]));
-        assert!(super::command_is_mutation(&[
-            "FAN",
-            "EMERGENCY",
-            "SET",
-            "100",
-            "90"
-        ]));
+        for command in [
+            &["FAN", "EMERGENCY", "SET", "100", "90"][..],
+            &["FAN", "EMERGENCY", "SET", "100", "90", "60", "60"][..],
+        ] {
+            assert!(super::command_is_mutation(command));
+        }
     }
 
     #[test]
